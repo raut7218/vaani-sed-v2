@@ -1,0 +1,98 @@
+seed: 42
+output_dir: runs/v2
+
+data:
+  root: data/vaani
+  sr: 16000
+  n_mels: 128
+  hop: 160                    # 10 ms mel frames into the CNN
+  clip_len: 8.0               # window (s). Corpus mean is 5.7 s; v1's 10 s
+                              # window was ~40% zero padding.
+  fps: 25.0                   # base output grid, 40 ms - matches ATST-Frame.
+                              # Boundaries are *regressed*, not thresholded, so
+                              # this grid does not cap boundary precision.
+                              # (A perfect model quantised to 25 fps scores
+                              # 1.988 on this metric; 50 fps buys +0.006.)
+  expand_vehicle: true
+  n_folds: 5                  # state-grouped k-fold. Select on the mean.
+  vad_dir: ""                 # scripts/make_vad.py output; enables the speech head
+
+model:
+  # ---- pretrained encoders, fused ----
+  # Order matters only for readability; all are concatenated after projection.
+  # ATST-Frame is primary: 40 ms tokens against a metric whose 10th-percentile
+  # tolerance is 59 ms. BEATs (160 ms) rides along as a semantic channel.
+  # Drop to [] for the no-encoder ablation.
+  encoders: [atst_frame, beats]
+  atst_ckpt: ""               # default checkpoints/atst_frame.ckpt
+  beats_ckpt: ""              # auto-downloaded if empty
+  beats_dir: checkpoints
+  proj_dim: 256
+  freeze_encoders: true       # staged unfreezing below
+
+  # ---- backbone ----
+  d_model: 384
+  n_levels: 5                 # 40 / 80 / 160 / 320 / 640 ms
+  n_base_layers: 2
+  n_head: 8
+  n_bins: 16                  # boundary distribution bins per level
+  dropout: 0.1
+  n_basis: 1                  # FDY conv basis kernels; 1 = plain conv.
+                              # Raise to 4 for the v1 ablation - it costs 4x the
+                              # conv FLOPs on a branch that was never the
+                              # bottleneck.
+  specaug: true
+  flux: true                  # spectral-flux onset channels alongside the mel
+  max_count: 8
+
+train:
+  epochs: 60                  # v1 stopped at 30 with val still rising
+  batch_size: 16              # per GPU under torchrun
+  lr: 0.0005
+  encoder_lr_scale: 0.05      # pretrained encoders train at 5% of the head LR
+  weight_decay: 0.05
+  warmup_steps: 800
+  grad_clip: 5.0
+  ema_decay: 0.999            # EMA of *weights*, not a mean-teacher consistency term
+  amp: true
+  num_workers: 4
+  prefetch_factor: 4
+  eval_every: 1
+  unfreeze_epoch: 12          # freeze -> low-LR unfreeze (the ATST-SED schedule)
+  unfreeze_blocks: 4
+  tier_quotas:
+    gold: 0.5                 # gold up-weighted vs v1: it is the only tier whose
+    silver: 0.35              # boundaries can supervise the regression head
+    bronze: 0.15
+
+loss:
+  cls: 1.0                    # focal on actionness
+  reg: 2.0                    # 1D DIoU on decoded spans
+  dfl: 0.5                    # distribution focal loss on boundary bins
+  quality: 0.5                # centerness
+  frame: 0.5                  # tier-masked frame BCE
+  dice: 1.0                   # soft Dice on the class-agnostic mask == half the metric
+  clip: 0.5                   # attention-pooled clip tags (the bronze tier's route in)
+  speech: 0.2                 # VAD auxiliary head
+  count: 0.2                  # events-per-clip head
+  # Silver's *tags* are as good as gold's; only its *timestamps* are unverified.
+  # So silver is down-weighted on frame/boundary terms only - the boundary
+  # down-weight itself lives in losses.py (0.25) where the spans are assigned.
+  silver_frame_weight: 0.5
+
+postproc:
+  # There is no detection threshold to tune here. These select *which* spans to
+  # keep; the boundaries themselves come from the regression head.
+  nms_sigma: 0.3               # tighter decay: near-duplicate spans are pure FPs
+  nms_iou: 0.35
+  score_floor: 0.05
+  count_weight: 1.0           # 1.0 = let the count head decide how many events
+  count_slack: 0               # trust the count head. A duplicate span is a
+                               # guaranteed false positive under 1-to-1 matching
+                               # *and* inflates coverage, so hedging upward loses
+                               # on both halves of the score. The calibrator can
+                               # still move this per district.
+  min_dur: 0.03
+  merge_gap: 0.0              # v1's merging dilated spans by a median 0.20 s
+  max_out: 16
+  score_scale: 1.0            # overwritten per district by the calibrator

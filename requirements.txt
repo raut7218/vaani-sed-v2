@@ -1,0 +1,12 @@
+# Colab and Kaggle already ship torch/torchaudio built against their CUDA runtime.
+# Do NOT pip-install torch there - it pulls a CPU build and silently disables the GPU.
+torch>=2.1
+torchaudio>=2.1
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12
+librosa>=0.10
+datasets>=2.18
+huggingface_hub>=0.23
+pyyaml>=6.0
+tqdm>=4.66

@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# checkpoints, data, run outputs
+/checkpoints/
+/data/
+/data_*/
+/runs/
+third_party/atst/ATST-SED/
+*.pt
+*.ckpt
+*.npz
+*.npy
+*.wav
+*.flac
+submission.zip
+submission.jsonl
+.DS_Store
