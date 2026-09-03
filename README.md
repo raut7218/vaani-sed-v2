@@ -87,12 +87,34 @@ python scripts/diagnose.py --ckpt runs/f0/best.pt --data data/vaani --fold 0
 python -m src.infer.predict --ckpt runs/f0/best.pt --audio-dir data/test --out submission.zip
 ```
 
-Multi-GPU (Kaggle `GPU T4 x2`) — `--batch-size` is **per GPU**, the standard DDP convention:
+### On Kaggle
+
+Open [`notebooks/Vaani_Track1_v2_Kaggle.ipynb`](notebooks/Vaani_Track1_v2_Kaggle.ipynb).
+Everything you need to edit is in one CONFIG cell at the top. Set the accelerator to
+**GPU T4 x2**, turn Internet on, and add `HF_TOKEN` under *Add-ons → Secrets* (the
+dataset is gated).
+
+`--batch-size` is **per GPU**, the standard DDP convention:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m src.train.train \
     --config configs/default.yaml --data data/vaani --out runs/f0 --batch-size 16
 ```
+
+A Kaggle GPU session stops at ~12 h and 60 epochs over 154 h of audio will not fit in
+one, so training writes `state.pt` every epoch and resumes losslessly:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m src.train.train \
+    --config configs/default.yaml --data data/vaani --out runs/f0 \
+    --batch-size 16 --resume auto
+```
+
+`--resume auto` restores the model, optimiser, GradScaler, EMA shadow, history and —
+critically — the **step counter**. Without the step counter the cosine schedule restarts
+and the learning rate jumps back up, which quietly undoes the previous session's
+progress. `state.pt` is written to a temp name and renamed, so a session killed
+mid-write leaves the previous state intact rather than a truncated file.
 
 ### The dataset
 

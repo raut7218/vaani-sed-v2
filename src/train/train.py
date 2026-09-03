@@ -150,7 +150,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=0, help="per GPU")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vad-dir", default="")
-    ap.add_argument("--resume", default="")
+    ap.add_argument("--resume", default="",
+                    help="'auto' resumes <out>/state.pt if present (Kaggle sessions "
+                         "cap at ~12 h), or give an explicit state.pt path")
     ap.add_argument("--no-encoders", action="store_true",
                     help="mel branch only; the encoder ablation")
     args = ap.parse_args()
@@ -231,11 +233,45 @@ def main() -> None:
     total_steps = epochs * len(sampler)
     warmup = int(t.get("warmup_steps", 500))
     step = 0
-    history, best = [], -1.0
-    refs = build_refs(va_ld, float(d["fps"])) if is_main() else {}
+    history, best, start_epoch = [], -1.0, 1
     unfreeze_at = int(t.get("unfreeze_epoch", 6))
 
-    for epoch in range(1, epochs + 1):
+    # --- resume -----------------------------------------------------------
+    # Kaggle caps a GPU session at ~12 h, which a 60-epoch run over 154 h of
+    # audio will not fit inside. `--resume auto` picks up `<out>/state.pt` if it
+    # exists, so a run spans as many sessions as it needs. The optimiser, the
+    # scaler, the EMA shadow and the step counter all have to come back: without
+    # the step counter the cosine schedule restarts and the LR jumps back up,
+    # which quietly undoes the previous session's progress.
+    resume_path = None
+    if args.resume:
+        p = (out_dir / "state.pt") if args.resume == "auto" else Path(args.resume)
+        resume_path = p if p.exists() else None
+        if args.resume != "auto" and resume_path is None:
+            raise SystemExit("--resume %s does not exist" % args.resume)
+    if resume_path is not None:
+        st = torch.load(str(resume_path), map_location="cpu", weights_only=False)
+        if int(st.get("unfroze_at_epoch", 0)):
+            # Rebuild the trainable set *before* loading the optimiser, or the
+            # param groups will not line up with the saved state.
+            _unwrap(model).encoder.unfreeze_last(int(t.get("unfreeze_blocks", 0)))
+            opt = torch.optim.AdamW(
+                make_param_groups(model, lr, float(t.get("encoder_lr_scale", 0.05)),
+                                  float(t["weight_decay"])))
+        _unwrap(model).load_state_dict(st["model"])
+        opt.load_state_dict(st["opt"])
+        scaler.load_state_dict(st["scaler"])
+        # In-place copy, so the EMA's cached tensor references stay valid.
+        ema.shadow.load_state_dict(st["ema"])
+        step, best = int(st["step"]), float(st["best"])
+        history = st.get("history", [])
+        start_epoch = int(st["epoch"]) + 1
+        log("[resume] %s -> epoch %d, step %d, best %.4f"
+            % (resume_path, start_epoch, step, best))
+
+    refs = build_refs(va_ld, float(d["fps"])) if is_main() else {}
+
+    for epoch in range(start_epoch, epochs + 1):
         if epoch == unfreeze_at + 1 and int(t.get("unfreeze_blocks", 0)) > 0:
             got = _unwrap(model).encoder.unfreeze_last(int(t["unfreeze_blocks"]))
             log("[train] unfroze top blocks per encoder: %s" % got)
@@ -300,6 +336,18 @@ def main() -> None:
                                                   encoding="utf-8")
             torch.save({"model": _unwrap(model).state_dict(), "cfg": cfg,
                         "classes": le.classes, "epoch": epoch}, out_dir / "last.pt")
+            # Full resume state, written every epoch. Written to a temp name and
+            # renamed so a session killed mid-write leaves the previous state
+            # intact rather than a truncated file.
+            tmp = out_dir / "state.pt.tmp"
+            torch.save({"model": _unwrap(model).state_dict(),
+                        "opt": opt.state_dict(), "scaler": scaler.state_dict(),
+                        "ema": ema.shadow.state_dict(), "step": step, "best": best,
+                        "epoch": epoch, "history": history, "cfg": cfg,
+                        "unfroze_at_epoch": epoch > unfreeze_at
+                        and int(t.get("unfreeze_blocks", 0)) > 0},
+                       tmp)
+            tmp.replace(out_dir / "state.pt")
 
     log("[done] best val score %.4f -> %s" % (best, out_dir / "best.pt"))
     if ddp:
