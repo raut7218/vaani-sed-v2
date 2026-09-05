@@ -234,6 +234,49 @@ def test_district():
           district_of("random_name") == "_global")
 
 
+# --------------------------------------------------------------------------- #
+# ATST-Frame, when its checkpoint is present
+# --------------------------------------------------------------------------- #
+def test_atst_encoder():
+    """Skipped without the checkpoint - but if it is there, it must be aligned.
+
+    The two failure modes this catches are both silent. Wrong mel statistics
+    (ATST wants its own 64-band, [-1, 1] scaled mel, not ours) still produce a
+    correctly shaped tensor, and a wrong time convention still trains - the head
+    just learns the offset and the event-F1 term pays for it.
+    """
+    ckpt = Path(__file__).resolve().parents[1] / "checkpoints" / "atst_frame.ckpt"
+    if not ckpt.exists():
+        print("%-58s skip (no checkpoints/atst_frame.ckpt)" % "atst: alignment")
+        return
+    from src.models.encoders import ATSTFrameEncoder
+
+    enc = ATSTFrameEncoder(ckpt).eval()
+    sr, dur, onset, offset = 16000, 8.0, 2.0, 2.5
+    torch.manual_seed(0)
+    wav = torch.zeros(1, int(sr * dur))
+    n = int((offset - onset) * sr)
+    wav[0, int(onset * sr):int(onset * sr) + n] = torch.randn(n) * 0.5
+    with torch.no_grad():
+        feat = enc(wav)[0]
+
+    check("atst: one token per 40 ms", feat.shape[0] == int(dur * 25),
+          "%d tokens" % feat.shape[0])
+    check("atst: 768-d output", feat.shape[1] == enc.out_dim == 768)
+
+    energy = feat.norm(dim=-1)
+    floor = energy[:20].mean()
+    hot = (energy > floor + 0.5 * (energy.max() - floor)).nonzero().flatten()
+    t0, t1 = hot[0].item() * 0.04, (hot[-1].item() + 1) * 0.04
+    # One token of slack at each edge: the burst boundary need not fall on a
+    # token boundary, and the patch that straddles it lights up either way.
+    # This is an alignment check, not a precision one - a wrong time convention
+    # is off by tens of tokens, not by one.
+    check("atst: the burst lands where it was put",
+          abs(t0 - onset) <= 0.05 and abs(t1 - offset) <= 0.05,
+          "%.2f-%.2f s vs %.2f-%.2f s" % (t0, t1, onset, offset))
+
+
 if __name__ == "__main__":
     test_metrics()
     test_subframe()
@@ -243,5 +286,6 @@ if __name__ == "__main__":
     test_soft_dice()
     test_nms_and_fusion()
     test_district()
+    test_atst_encoder()
     print("\n%d/%d checks passed" % (sum(OK), len(OK)))
     sys.exit(0 if all(OK) else 1)

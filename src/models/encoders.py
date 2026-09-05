@@ -131,6 +131,18 @@ class BEATsEncoder(EncoderBase):
 # --------------------------------------------------------------------------- #
 # ATST-Frame - 40 ms tokens. The primary encoder.
 # --------------------------------------------------------------------------- #
+# ATST-Frame does not take a waveform. It takes *its own* mel: 64 bands,
+# 60-7800 Hz, 10 ms hop, converted to dB and min-max scaled to [-1, 1] with the
+# fixed constants the checkpoint was trained under. Feeding it anything else -
+# our own 128-band mel, or a raw waveform - produces a tensor of the right shape
+# and completely wrong statistics, which is the failure mode this file's docstring
+# is about. These numbers are copied from the upstream
+# `ATSTTransform` / `ATSTNorm` pair, not chosen.
+ATST_MEL = dict(sample_rate=16000, f_min=60, f_max=7800, hop_length=160,
+                win_length=1024, n_fft=1024, n_mels=64)
+ATST_DB_MIN, ATST_DB_MAX = -79.6482, 50.6842
+
+
 class ATSTFrameEncoder(EncoderBase):
     """Adapter around the official ATST-Frame implementation.
 
@@ -146,9 +158,12 @@ class ATSTFrameEncoder(EncoderBase):
 
     def __init__(self, ckpt_path, freeze: bool = True, min_load_frac: float = 0.9):
         super().__init__()
+        import torchaudio
         model, dim = _load_atst(ckpt_path, min_load_frac)
         self.atst = model
         self.out_dim = dim
+        self.mel = torchaudio.transforms.MelSpectrogram(**ATST_MEL)
+        self.amp_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
         self.frozen = freeze
         if freeze:
             for p in self.atst.parameters():
@@ -173,10 +188,33 @@ class ATSTFrameEncoder(EncoderBase):
         self.frozen = False
         return min(n_blocks, len(blocks))
 
+    def features(self, wav: torch.Tensor) -> torch.Tensor:
+        """(B, L) waveform -> (B, 64, T) normalised mel, exactly as upstream."""
+        # fp32 regardless of the surrounding autocast: the mel is a fixed
+        # transform, and half-precision STFT costs accuracy for no speed here.
+        with torch.autocast(device_type=wav.device.type, enabled=False):
+            spec = self.mel(wav.float())
+            spec = self.amp_to_db(spec).clamp(min=-50, max=80)
+            spec = (spec - ATST_DB_MIN) / (ATST_DB_MAX - ATST_DB_MIN) * 2.0 - 1.0
+        return spec
+
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         ctx = torch.no_grad() if self.frozen else torch.enable_grad()
         with ctx:
-            out = self.atst(wav)
+            spec = self.features(wav)                      # (B, 64, T)
+            n_mel = spec.size(-1)
+            if hasattr(self.atst, "get_intermediate_layers"):
+                # The upstream signature: (B, 1, mel, T) plus the unpadded mel
+                # length, which becomes the token-level attention mask. Upstream
+                # hardcodes 1001 because it only ever sees 10 s clips; ours are
+                # `clip_len` long, so pass the real length or the tail of every
+                # clip is masked out.
+                length = torch.full((spec.size(0),), float(n_mel),
+                                    device=spec.device, dtype=torch.float32)
+                out = self.atst.get_intermediate_layers(
+                    spec.unsqueeze(1), length, 1, scene=False)
+            else:
+                out = self.atst(spec.unsqueeze(1))
             if isinstance(out, (tuple, list)):
                 out = out[0]
             if out.dim() == 3 and out.size(1) == self.out_dim and out.size(2) != self.out_dim:
@@ -198,6 +236,43 @@ def _atst_blocks(model: nn.Module):
     return None
 
 
+# The three checkpoint layouts in circulation, in the order they are tested.
+# Every one of them stores the same FrameAST tensors under a different prefix,
+# and `load_state_dict(strict=False)` on the wrong prefix loads *nothing* while
+# reporting success - which is exactly the silent half-load `min_load_frac`
+# exists to catch. Mapping them explicitly is cheaper than catching it late.
+def _atst_frame_state(sd: dict) -> dict:
+    """Reduce any known ATST checkpoint layout to bare FrameAST keys."""
+    for key in ("state_dict", "model", "teacher", "student"):
+        if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
+            sd = sd[key]
+            break
+    sd = {k.replace("module.", ""): v for k, v in sd.items()}
+
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("atst_frame.atst."):        # ATST-SED stage-1/2 finetune
+            out[k[len("atst_frame.atst."):]] = v
+        elif k.startswith("atst."):
+            out[k[len("atst."):]] = v
+        elif "model.teacher.encoder." in k:         # atst_as2M.ckpt, pretrained
+            if "cls_token" in k:
+                continue                            # FrameAST has no CLS token
+            nk = k.split("model.teacher.encoder.", 1)[1]
+            # upstream renames the encoder's final norm on the way in
+            if nk.startswith("norm."):
+                nk = "norm_frame." + nk[len("norm."):]
+            out[nk] = v
+        elif "encoder.encoder.teacher_module." in k:
+            continue
+        elif "encoder.encoder.frame_encoder." in k:  # C2F
+            out[k.split("encoder.encoder.frame_encoder.", 1)[1]] = v
+        elif "encoder.encoder." in k:
+            out[k.split("encoder.encoder.", 1)[1]] = v
+    # Nothing matched a known prefix: the checkpoint is already bare FrameAST.
+    return out or sd
+
+
 def _load_atst(ckpt_path, min_load_frac: float):
     """Import the vendored ATST source and load `ckpt_path` into it."""
     atst_dir = _ROOT / "third_party" / "atst"
@@ -205,13 +280,16 @@ def _load_atst(ckpt_path, min_load_frac: float):
         raise FileNotFoundError(
             "third_party/atst is missing. Run `python scripts/fetch_encoders.py "
             "--atst` to vendor the upstream ATST-Frame source and checkpoint.")
-    if str(atst_dir) not in sys.path:
-        sys.path.insert(0, str(atst_dir))
+    for p in (atst_dir, atst_dir / "ATST-SED"):
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
 
     build = None
-    for mod_name, fn_name in (("atst_adapter", "build_atst_frame"),
-                              ("audiossl.models.atst.frame", "ATSTFrame"),
-                              ("models.atst", "ATST")):
+    for mod_name, fn_name in (
+            ("atst_adapter", "build_atst_frame"),
+            ("desed_task.nnet.atst.audio_transformer", "FrameASTModel"),
+            ("audiossl.models.atst.frame", "ATSTFrame"),
+            ("models.atst", "ATST")):
         try:
             mod = __import__(mod_name, fromlist=[fn_name])
             build = getattr(mod, fn_name)
@@ -225,12 +303,7 @@ def _load_atst(ckpt_path, min_load_frac: float):
 
     model = build() if callable(build) else build
     sd = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    for key in ("state_dict", "model", "teacher", "student"):
-        if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
-            sd = sd[key]
-            break
-    sd = {k.replace("module.", ""): v for k, v in sd.items()}
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing, unexpected = model.load_state_dict(_atst_frame_state(sd), strict=False)
 
     total = len(model.state_dict())
     loaded = total - len(missing)

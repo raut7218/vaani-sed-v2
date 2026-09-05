@@ -10,3 +10,5 @@ datasets>=2.18
 huggingface_hub>=0.23
 pyyaml>=6.0
 tqdm>=4.66
+einops>=0.6                   # the vendored ATST-Frame source uses einops.Rearrange
+gdown>=4.7                    # fallback route to the ATST-Frame weights (Google Drive)

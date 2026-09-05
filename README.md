@@ -126,8 +126,20 @@ is a 9-clip *sample*; only the full repo trains anything.
 ### The ATST-Frame checkpoint
 
 `fetch_encoders.py --atst` clones the upstream
-[ATST-SED](https://github.com/Audio-WestlakeU/ATST-SED) source and tries to pull the
-weights. If the mirror moves, download them manually to `checkpoints/atst_frame.ckpt`.
+[ATST-SED](https://github.com/Audio-WestlakeU/ATST-SED) source and pulls the weights.
+The authors publish them on Google Drive, not on the Hub, so the script tries a Hub
+mirror of the ATST-SED stage-2 checkpoint first (the ATST-Frame encoder sits inside it
+under `atst_frame.atst.*`) and falls back to the authors' own `atst_as2M.ckpt` via
+`gdown`. Both layouts, and the C2F one, are normalised to bare `FrameAST` keys by
+`_atst_frame_state`, and the download is checked for ATST-Frame marker tensors before
+it is kept. If both routes fail, download `atst_as2M.ckpt` manually to
+`checkpoints/atst_frame.ckpt`.
+
+ATST-Frame consumes **its own** mel — 64 bands, 60–7800 Hz, 10 ms hop, dB, min-max
+scaled to [-1, 1] — not a waveform and not our 128-band mel; `ATSTFrameEncoder.features`
+reproduces the upstream transform exactly, and `tests/test_components.py` asserts a
+burst at a known time lands on the right token whenever the checkpoint is present.
+
 The loader **refuses to run** if under 90% of the checkpoint's tensors land in the
 model — a half-loaded encoder trains a partly-random network and still produces a
 perfectly plausible loss curve, which is the single most expensive silent failure
