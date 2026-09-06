@@ -235,6 +235,71 @@ def test_district():
 
 
 # --------------------------------------------------------------------------- #
+# EMA over an encoder that uses weight_norm
+# --------------------------------------------------------------------------- #
+def test_ema_weight_norm():
+    """The EMA must be able to clone a model carrying `weight_norm`.
+
+    BEATs applies the deprecated `torch.nn.utils.weight_norm` to its `pos_conv`,
+    which caches the weight it computes as a plain non-leaf attribute - and
+    `copy.deepcopy` refuses those outright. A run therefore died on the first
+    line of training, *after* the encoders had loaded, which on Kaggle is three
+    hours in. `encoders: []` in the overfit and smoke configs meant nothing in
+    the suite ever built a weight_norm module, so this test builds one.
+    """
+    import torch.nn as nn
+    from src.train.train import EMA
+
+    class WeightNormEncoder(nn.Module):
+        """A stand-in for BEATs' pos_conv, built the same way."""
+
+        def __init__(self):
+            super().__init__()
+            conv = nn.Conv1d(16, 16, 3, padding=1, groups=2)
+            self.pos_conv = nn.Sequential(nn.utils.weight_norm(conv, name="weight", dim=2))
+
+        def forward(self, x):
+            return self.pos_conv(x)
+
+    torch.manual_seed(0)
+    model = WeightNormEncoder()
+    try:
+        ema = EMA(model, decay=0.9)
+        built = True
+    except RuntimeError as e:                                      # noqa: BLE001
+        ema, built = None, False
+        check("ema: clones a weight_norm model", False, str(e)[:60])
+    if not built:
+        return
+
+    check("ema: clones a weight_norm model", True)
+    check("ema: shadow is an independent module",
+          ema.shadow.pos_conv[0] is not model.pos_conv[0])
+    check("ema: the original still has its cached weight",
+          "weight" in model.pos_conv[0].__dict__)
+    check("ema: the cached weight stays out of state_dict",
+          not any(k.endswith("pos_conv.0.weight") for k in ema.shadow.state_dict()))
+
+    # decay 0.9, one step: shadow <- 0.9 * shadow + 0.1 * model
+    key = "pos_conv.0.weight_v"
+    before = ema.shadow.state_dict()[key].clone()
+    with torch.no_grad():
+        model.state_dict()[key].add_(1.0)
+    after_src = model.state_dict()[key].clone()
+    ema.update(model)
+    want = 0.9 * before + 0.1 * after_src
+    check("ema: update averages towards the model",
+          torch.allclose(ema.shadow.state_dict()[key], want, atol=1e-6))
+
+    # The shadow is evaluated and checkpointed, so both paths have to work on it.
+    x = torch.randn(2, 16, 32)
+    with torch.no_grad():
+        out = ema.shadow(x)
+    check("ema: the shadow runs a forward pass", out.shape == (2, 16, 32))
+    ema.shadow.load_state_dict(ema.shadow.state_dict())
+    check("ema: the shadow survives a state_dict round-trip (--resume)", True)
+
+# --------------------------------------------------------------------------- #
 # ATST-Frame, when its checkpoint is present
 # --------------------------------------------------------------------------- #
 def test_atst_encoder():
@@ -286,6 +351,7 @@ if __name__ == "__main__":
     test_soft_dice()
     test_nms_and_fusion()
     test_district()
+    test_ema_weight_norm()
     test_atst_encoder()
     print("\n%d/%d checks passed" % (sum(OK), len(OK)))
     sys.exit(0 if all(OK) else 1)

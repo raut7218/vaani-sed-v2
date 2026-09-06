@@ -63,6 +63,35 @@ def setup_ddp() -> tuple:
     return dev, False
 
 
+def clone_module(model: torch.nn.Module) -> torch.nn.Module:
+    """`copy.deepcopy` of a module that may carry `torch.nn.utils.weight_norm`.
+
+    The deprecated `weight_norm` caches the weight it computes as a *plain
+    attribute* on the module, and that tensor is a non-leaf, which `deepcopy`
+    refuses outright (pytorch#103001). BEATs builds its `pos_conv` that way, and
+    so does torchaudio's WavLM, so the copy has to route around the cache rather
+    than around one encoder: the cached tensors are lifted off for the duration
+    of the copy and put straight back. `state_dict()` never held them - the copy
+    carries `weight_g`/`weight_v` like any other parameter and the pre-forward
+    hook recomputes the weight - but they are restored on the clone too, so
+    anything reading `.weight` before its first forward still finds a tensor.
+    """
+    stash = []
+    for name, mod in model.named_modules():
+        for k, v in list(mod.__dict__.items()):
+            if torch.is_tensor(v) and not v.is_leaf:
+                stash.append((name, mod, k, v))
+                del mod.__dict__[k]
+    try:
+        clone = copy.deepcopy(model)
+    finally:
+        for _, mod, k, v in stash:
+            mod.__dict__[k] = v
+    for name, _, k, v in stash:
+        setattr(clone.get_submodule(name), k, v.detach().clone())
+    return clone
+
+
 class EMA:
     """Exponential moving average of the weights.
 
@@ -73,7 +102,7 @@ class EMA:
 
     def __init__(self, model, decay: float = 0.999):
         self.decay = decay
-        self.shadow = copy.deepcopy(_unwrap(model)).eval()
+        self.shadow = clone_module(_unwrap(model)).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
         self._src, self._dst = [], []
