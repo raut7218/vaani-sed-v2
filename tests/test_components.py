@@ -182,6 +182,54 @@ def test_soft_dice():
     check("soft_dice: perfect -> ~0", soft_dice(logits, tgt, m).item() < 1e-3)
     check("soft_dice: inverted -> ~1", soft_dice(-logits, tgt, m).item() > 0.99)
 
+    # A per-clip weight must scale the *loss*, never the mask. Folding it into
+    # the mask scales the numerator by w^2 and the denominator by w, which put an
+    # irreducible 0.5 floor under every silver clip.
+    w = torch.tensor([0.5])
+    check("soft_dice: a down-weighted perfect clip still scores ~0",
+          soft_dice(logits, tgt, m, w).item() < 1e-3,
+          "%.4f" % soft_dice(logits, tgt, m, w).item())
+    check("soft_dice: weight scales the loss, not the score",
+          abs(soft_dice(-logits, tgt, m, w).item()
+              - soft_dice(-logits, tgt, m).item()) < 1e-3)
+    # Weight 0 (bronze) must drop the clip out of the mean, not drag it to 0.
+    two = torch.cat([logits, -logits]), torch.cat([tgt, tgt]), torch.ones(2, 4)
+    check("soft_dice: zero-weight clips are excluded",
+          abs(soft_dice(*two, torch.tensor([1.0, 0.0])).item()
+              - soft_dice(logits, tgt, m).item()) < 1e-3)
+
+
+def test_sampler_sharding():
+    from src.data.dataset import TierBatchSampler
+    recs = [{"tier": ["gold", "silver", "silver", "silver", "bronze"][i % 5],
+             "uid": str(i)} for i in range(4000)]
+    kw = dict(quotas={"gold": 0.5, "silver": 0.35, "bronze": 0.15}, seed=42)
+    r0 = list(TierBatchSampler(recs, 16, rank=0, world_size=2, **kw))
+    r1 = list(TierBatchSampler(recs, 16, rank=1, world_size=2, **kw))
+    check("sampler: ranks get the same number of batches", len(r0) == len(r1))
+    check("sampler: ranks get different batches", r0 != r1)
+    flat0 = {i for b in r0 for i in b}
+    flat1 = {i for b in r1 for i in b}
+    check("sampler: the two shards are not the same clips",
+          len(flat0 & flat1) < 0.9 * len(flat0))
+    solo = TierBatchSampler(recs, 16, rank=0, world_size=1, **kw)
+    check("sampler: 2 ranks halve the per-rank epoch",
+          abs(len(solo) - 2 * len(r0)) <= 1, "%d vs 2x%d" % (len(solo), len(r0)))
+    check("sampler: quotas still hold per batch",
+          all(len(b) == 16 for b in r0))
+
+
+def test_tta_deshift():
+    """The shift applied to the waveform and the offset subtracted from the
+    decoded spans have to be the same number of seconds."""
+    fps, n_frames, wav_len = 25.0, 200, 128000        # 8 s @ 16 kHz
+    samples_per_sec = wav_len / (n_frames / fps)
+    shift = int(0.02 * samples_per_sec)
+    dt = shift / samples_per_sec
+    check("tta: de-shift matches the shift applied", abs(dt - shift / 16000) < 1e-9,
+          "%.4f s" % dt)
+    check("tta: de-shift is ~20 ms, not ~0.8 ms", abs(dt - 0.02) < 1e-6)
+
 
 # --------------------------------------------------------------------------- #
 # decoding
@@ -349,6 +397,8 @@ if __name__ == "__main__":
     test_decode_spans()
     test_assign()
     test_soft_dice()
+    test_sampler_sharding()
+    test_tta_deshift()
     test_nms_and_fusion()
     test_district()
     test_ema_weight_norm()

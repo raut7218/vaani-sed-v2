@@ -43,6 +43,18 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
+def _log(*a):
+    """Print from rank 0 only.
+
+    Every rank builds its own encoder stack, so under torchrun each of these
+    lines appeared once per GPU and the checkpoint-load report read as though the
+    weights had been loaded twice.
+    """
+    import os
+    if os.environ.get("RANK", "0") == "0":
+        print(*a, flush=True)
+
+
 class EncoderBase(nn.Module):
     """(B, L) waveform at 16 kHz -> (B, T, D) time-major features."""
 
@@ -75,7 +87,7 @@ def download_beats(dest="checkpoints"):
         shutil.copy(p, local)
         return local
     except Exception as e:                                        # noqa: BLE001
-        print("[beats] download failed: %s" % e)
+        _log("[beats] download failed: %s" % e)
         return None
 
 
@@ -92,7 +104,7 @@ class BEATsEncoder(EncoderBase):
         model = BEATs(cfg)
         missing, _ = model.load_state_dict(ckpt["model"], strict=False)
         if missing:
-            print("[beats] missing keys: %d (first: %s)" % (len(missing), missing[:3]))
+            _log("[beats] missing keys: %d (first: %s)" % (len(missing), missing[:3]))
         model.predictor = None      # we want hidden states, not AudioSet logits
         self.beats = model
         self.out_dim = cfg.encoder_embed_dim
@@ -308,8 +320,8 @@ def _load_atst(ckpt_path, min_load_frac: float):
     total = len(model.state_dict())
     loaded = total - len(missing)
     frac = loaded / max(total, 1)
-    print("[atst] loaded %d/%d tensors (%.1f%%), %d unexpected"
-          % (loaded, total, 100 * frac, len(unexpected)))
+    _log("[atst] loaded %d/%d tensors (%.1f%%), %d unexpected"
+         % (loaded, total, 100 * frac, len(unexpected)))
     if frac < min_load_frac:
         raise RuntimeError(
             "ATST checkpoint only populated %.1f%% of the model (threshold %.0f%%). "
@@ -441,15 +453,15 @@ def build_encoder(cfg: dict, ckpt_dir="checkpoints") -> FusionEncoder:
             elif name == "wavlm":
                 built.append(WavLMEncoder(freeze=freeze))
             else:
-                print("[encoders] unknown encoder %r, skipping" % name)
+                _log("[encoders] unknown encoder %r, skipping" % name)
                 continue
-            print("[encoders] + %s (%.0f ms frames, %d-d)"
-                  % (name, built[-1].frame_ms, built[-1].out_dim))
+            _log("[encoders] + %s (%.0f ms frames, %d-d)"
+                 % (name, built[-1].frame_ms, built[-1].out_dim))
         except Exception as e:                                     # noqa: BLE001
-            print("[encoders] ! %s unavailable: %s" % (name, e))
+            _log("[encoders] ! %s unavailable: %s" % (name, e))
 
     if not built:
-        print("[encoders] no pretrained encoder available - running on the "
-              "high-resolution mel branch alone. Expect a much lower score.")
+        _log("[encoders] no pretrained encoder available - running on the "
+             "high-resolution mel branch alone. Expect a much lower score.")
     return FusionEncoder(built, proj_dim=int(cfg.get("proj_dim", 256)),
                          dropout=float(cfg.get("dropout", 0.1)))

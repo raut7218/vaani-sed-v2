@@ -96,13 +96,20 @@ def run_loader(model, loader, device, fps: float, pp: dict | None = None,
             # Time-shift TTA. A half-frame shift is the cheapest probe of
             # boundary stability there is, and fusing the two span sets
             # (never the posteriors) keeps the edges sharp.
-            shift = int(0.02 * wav.size(-1) / (fv.size(1) / fps))
+            samples_per_sec = wav.size(-1) / (fv.size(1) / fps)
+            shift = int(0.02 * samples_per_sec)
             wav2 = torch.roll(wav, shifts=shift, dims=-1)
             with torch.autocast(device_type=device.type,
                                 enabled=amp and device.type == "cuda"):
                 out2 = model(wav2, fv)
             c2 = spans_from_output(out2, fps, durations, pp)
-            dt = shift / (wav.size(-1) / (fv.size(1) / fps)) / fps
+            # `shift / samples_per_sec` is already seconds. The extra `/ fps` this
+            # used to carry made the correction 25x too small, so the shifted
+            # branch's spans came back still displaced by ~19 ms of the 20 ms
+            # shift - and were then fused with the unshifted ones, smearing every
+            # boundary by roughly half that. TTA is on by default in predict.py,
+            # so this was live on every submission.
+            dt = shift / samples_per_sec
             for c in c2:
                 if len(c["spans"]):
                     c["spans"] = c["spans"] - dt

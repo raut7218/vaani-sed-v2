@@ -94,7 +94,7 @@ class VaaniSpanDataset(Dataset):
     def __init__(self, records: Sequence[dict], root: str | Path, le: LabelEncoder,
                  clip_len: float = 8.0, sr: int = 16000, fps: float = 25.0,
                  train: bool = True, augment: bool = True,
-                 vad_dir: str | Path | None = None):
+                 vad_dir: str | Path | None = None, labels_only: bool = False):
         self.recs = list(records)
         self.root = Path(root)
         self.le = le
@@ -106,6 +106,11 @@ class VaaniSpanDataset(Dataset):
         self.n_samples = int(round(self.clip_len * self.sr))
         self.n_frames = int(round(self.clip_len * self.fps))
         self.vad_dir = Path(vad_dir) if vad_dir else None
+        # `labels_only` skips the audio decode and returns silence in its place.
+        # `build_refs` wants nothing but `spans` and `uid`, and decoding 14.5k
+        # validation clips to read two label tensors off them costs a minute of
+        # every run for nothing.
+        self.labels_only = bool(labels_only)
 
     def __len__(self) -> int:
         return len(self.recs)
@@ -138,7 +143,15 @@ class VaaniSpanDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict:
         rec = self.recs[i]
-        y = self._load_wav(rec)
+        # The crop offset below is a function of the clip's *length* only, so
+        # labels can be produced from the manifest duration without touching the
+        # audio - but only if the duration is actually there. A missing one would
+        # silently shift every reference span, so fall back to decoding.
+        if self.labels_only and rec.get("duration"):
+            y = np.zeros((max(1, int(round(float(rec["duration"]) * self.sr))),),
+                         "float32")
+        else:
+            y = self._load_wav(rec)
         events = rec.get("events") or []
 
         # --- crop / pad to the window, shifting event times with the crop ---
@@ -225,18 +238,31 @@ def collate(batch: List[dict]) -> dict:
 
 
 class TierBatchSampler(Sampler):
-    """Compose every batch from fixed per-tier quotas.
+    """Compose every batch from fixed per-tier quotas, sharded across ranks.
 
     Kept from v1: with tiers this imbalanced a plain random sampler produces
     batches with no gold at all, and the boundary terms then have nothing
     trustworthy to learn from for whole stretches of training.
+
+    **Rank sharding.** Every rank builds the identical global batch list (same
+    records, same seed) and then keeps only its own stride-`world_size` slice of
+    it. Without that slice, which is how this was written until now, both ranks
+    of a `torchrun --nproc_per_node 2` job draw the *same* indices on every step:
+    the seed is identical, the record order is identical, and nothing in the
+    sampler ever looks at the rank. DDP then all-reduces two copies of one
+    gradient, so a 2-GPU run costs twice the compute of a 1-GPU run and learns
+    from exactly the same 16 clips per step. Sharding turns the second GPU back
+    into a real doubling of the effective batch.
     """
 
     def __init__(self, records: Sequence[dict], batch_size: int,
-                 quotas: Dict[str, float] | None = None, seed: int = 0):
+                 quotas: Dict[str, float] | None = None, seed: int = 0,
+                 rank: int = 0, world_size: int = 1):
         self.records = list(records)
         self.batch_size = int(batch_size)
         self.seed = seed
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
         self.by_tier: Dict[str, List[int]] = {}
         for i, r in enumerate(self.records):
             self.by_tier.setdefault(r.get("tier", "bronze"), []).append(i)
@@ -255,18 +281,22 @@ class TierBatchSampler(Sampler):
             rem -= 1
         self.counts = {k: v for k, v in self.counts.items() if v > 0}
         self._nb = max(1, min(len(self.by_tier[k]) // c for k, c in self.counts.items()))
+        # Truncate to a whole number of rounds so every rank yields the same
+        # number of batches. A rank that runs short leaves its peers blocked in
+        # an all-reduce that never completes.
+        self._per_rank = max(1, self._nb // self.world_size)
 
     def __len__(self) -> int:
-        return self._nb
+        return self._per_rank
 
-    def __iter__(self):
+    def _global_batches(self) -> List[List[int]]:
         rng = random.Random(self.seed)
-        self.seed += 1
         pools = {k: list(v) for k, v in self.by_tier.items()}
         for v in pools.values():
             rng.shuffle(v)
         ptr = {k: 0 for k in pools}
-        for _ in range(self._nb):
+        out: List[List[int]] = []
+        for _ in range(self._per_rank * self.world_size):
             batch: List[int] = []
             for k, c in self.counts.items():
                 pool = pools[k]
@@ -279,4 +309,11 @@ class TierBatchSampler(Sampler):
                 batch.extend(pool[ptr[k]:ptr[k] + c])
                 ptr[k] += c
             rng.shuffle(batch)
-            yield batch
+            out.append(batch)
+        return out
+
+    def __iter__(self):
+        batches = self._global_batches()
+        self.seed += 1
+        for b in batches[self.rank::self.world_size]:
+            yield b

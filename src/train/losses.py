@@ -80,67 +80,68 @@ def assign_targets(spans: torch.Tensor, span_cls: torch.Tensor, tier: torch.Tens
         T = p.numel()
         lo, hi = LEVEL_RANGES[min(lvl, len(LEVEL_RANGES) - 1)]
 
+        # Only `cls` needs zeroing: it is scattered into. The other five are
+        # assigned outright below.
         cls = spans.new_zeros((B, T, n_class + 1))
-        ds = spans.new_zeros((B, T))
-        de = spans.new_zeros((B, T))
-        pos = spans.new_zeros((B, T))
-        qual = spans.new_zeros((B, T))
-        bw = spans.new_zeros((B, T))
 
+        # No `if in_level.any()` guard here, and none around the `none_yet`
+        # branch below. Reading a bool off a CUDA tensor forces a device
+        # synchronisation, and this loop runs once per level per step - the
+        # guards cost more in pipeline stalls than the work they skip, and the
+        # arithmetic below already collapses to zero when nothing is assigned.
         in_level = valid_ev & (lengths >= lo) & (lengths < hi)         # (B, M)
-        if in_level.any():
-            a = spans[..., 0].unsqueeze(-1)                            # (B, M, 1)
-            b = spans[..., 1].unsqueeze(-1)
-            pp = p.view(1, 1, T)
-            d_start = (pp - a) / stride
-            d_end = (b - pp) / stride
-            inside = (d_start >= 0) & (d_end >= 0)
-            centre = (a + b) / 2
-            near = (pp - centre).abs() <= CENTER_RADIUS * stride
-            ok = inside & (near | inside) & in_level.unsqueeze(-1)
-            # Centre sampling proper: prefer near-centre points, but never let a
-            # short event end up with zero positives just because it is narrower
-            # than one stride.
-            strict = inside & near & in_level.unsqueeze(-1)
-            has_strict = strict.any(dim=-1, keepdim=True)
-            ok = torch.where(has_strict, strict, ok)
 
-            # An event shorter than a stride can miss every point; fall back to
-            # the single closest point so it still supervises something.
-            none_yet = in_level & ~ok.any(dim=-1)
-            if none_yet.any():
-                nearest = (pp - centre).abs().argmin(dim=-1)           # (B, M)
-                idx = F.one_hot(nearest, T).bool() & none_yet.unsqueeze(-1)
-                ok = ok | idx
-                d_start = torch.where(idx, d_start.clamp(min=0.0), d_start)
-                d_end = torch.where(idx, d_end.clamp(min=0.0), d_end)
+        a = spans[..., 0].unsqueeze(-1)                             # (B, M, 1)
+        b = spans[..., 1].unsqueeze(-1)
+        pp = p.view(1, 1, T)
+        d_start = (pp - a) / stride
+        d_end = (b - pp) / stride
+        inside = (d_start >= 0) & (d_end >= 0)
+        centre = (a + b) / 2
+        near = (pp - centre).abs() <= CENTER_RADIUS * stride
+        ok = inside & (near | inside) & in_level.unsqueeze(-1)
+        # Centre sampling proper: prefer near-centre points, but never let a
+        # short event end up with zero positives just because it is narrower
+        # than one stride.
+        strict = inside & near & in_level.unsqueeze(-1)
+        has_strict = strict.any(dim=-1, keepdim=True)
+        ok = torch.where(has_strict, strict, ok)
 
-            # Smallest event wins a contested point: short events are the ones
-            # this model is bad at, and letting a long span absorb their points
-            # is exactly the v1 failure mode (short events swallowed by blobs).
-            big = torch.where(ok, lengths.unsqueeze(-1), torch.full_like(d_start, 1e9))
-            best = big.argmin(dim=1)                                   # (B, T)
-            any_pos = ok.any(dim=1).float()                            # (B, T)
+        # An event shorter than a stride can miss every point; fall back to
+        # the single closest point so it still supervises something.
+        none_yet = in_level & ~ok.any(dim=-1)
+        nearest = (pp - centre).abs().argmin(dim=-1)               # (B, M)
+        idx = F.one_hot(nearest, T).bool() & none_yet.unsqueeze(-1)
+        ok = ok | idx
+        d_start = torch.where(idx, d_start.clamp(min=0.0), d_start)
+        d_end = torch.where(idx, d_end.clamp(min=0.0), d_end)
 
-            g = best.unsqueeze(1)
-            sel_ds = torch.gather(d_start, 1, g).squeeze(1).clamp(0, n_bins - 1 - 1e-3)
-            sel_de = torch.gather(d_end, 1, g).squeeze(1).clamp(0, n_bins - 1 - 1e-3)
-            sel_cls = torch.gather(span_cls, 1, best).clamp(min=0)
-            sel_bw = torch.gather(ev_bw, 1, best)
+        # Smallest event wins a contested point: short events are the ones
+        # this model is bad at, and letting a long span absorb their points
+        # is exactly the v1 failure mode (short events swallowed by blobs).
+        big = torch.where(ok, lengths.unsqueeze(-1), torch.full_like(d_start, 1e9))
+        best = big.argmin(dim=1)                                   # (B, T)
+        any_pos = ok.any(dim=1).float()                            # (B, T)
 
-            ds = sel_ds * any_pos
-            de = sel_de * any_pos
-            pos = any_pos
-            bw = sel_bw * any_pos
-            # Centerness: down-weight points near an edge, where the far
-            # boundary is a long extrapolation and least reliable.
-            mn = torch.minimum(sel_ds, sel_de)
-            mx = torch.maximum(sel_ds, sel_de).clamp(min=1e-6)
-            qual = (mn / mx).clamp(0, 1).sqrt() * any_pos
+        g = best.unsqueeze(1)
+        sel_ds = torch.gather(d_start, 1, g).squeeze(1).clamp(0, n_bins - 1 - 1e-3)
+        sel_de = torch.gather(d_end, 1, g).squeeze(1).clamp(0, n_bins - 1 - 1e-3)
+        sel_cls = torch.gather(span_cls, 1, best).clamp(min=0)
+        sel_bw = torch.gather(ev_bw, 1, best)
 
-            cls.scatter_(2, sel_cls.unsqueeze(-1), any_pos.unsqueeze(-1))
-            cls[..., n_class] = any_pos                                # agnostic channel
-            cls = cls * any_pos.unsqueeze(-1)
+        ds = sel_ds * any_pos
+        de = sel_de * any_pos
+        pos = any_pos
+        bw = sel_bw * any_pos
+        # Centerness: down-weight points near an edge, where the far
+        # boundary is a long extrapolation and least reliable.
+        mn = torch.minimum(sel_ds, sel_de)
+        mx = torch.maximum(sel_ds, sel_de).clamp(min=1e-6)
+        qual = (mn / mx).clamp(0, 1).sqrt() * any_pos
+
+        cls.scatter_(2, sel_cls.unsqueeze(-1), any_pos.unsqueeze(-1))
+        cls[..., n_class] = any_pos                                # agnostic channel
+        cls = cls * any_pos.unsqueeze(-1)
 
         m = masks[lvl]
         cls_t.append(cls * m.unsqueeze(-1))
@@ -204,12 +205,20 @@ def distribution_focal(logits: torch.Tensor, target: torch.Tensor) -> torch.Tens
 
 
 def soft_dice(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-              eps: float = 1e-4) -> torch.Tensor:
+              weight: torch.Tensor | None = None, eps: float = 1e-4) -> torch.Tensor:
     """Per-clip soft Dice on the class-agnostic frame mask, macro-averaged.
 
     Macro, not micro, because the metric is macro - a two-second clip counts as
     much as a twenty-second one, and optimising the duration-weighted version
     quietly favours the long stationary classes.
+
+    `mask` says which *frames* are real; `weight` says how much each *clip*
+    counts. They are not interchangeable, and folding a per-clip weight into the
+    mask is silently wrong: scaling both `p` and `t` by w scales the numerator by
+    w^2 and the denominator by w, so a clip weighted 0.5 bottoms out at a Dice of
+    0.5 no matter how perfect its prediction is. That put an irreducible 0.5
+    floor under every silver clip - 68% of the corpus - and left the term with a
+    gradient pointing nowhere useful.
     """
     p = logits.sigmoid() * mask
     t = target * mask
@@ -217,7 +226,10 @@ def soft_dice(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
     den = p.sum(dim=1) + t.sum(dim=1)
     # A clip with no events and no prediction is a perfect Dice of 1.0 under the
     # official scorer; the eps makes that the fixed point here too.
-    return (1.0 - (num + eps) / (den + eps)).mean()
+    per_clip = 1.0 - (num + eps) / (den + eps)
+    if weight is None:
+        return per_clip.mean()
+    return (per_clip * weight).sum() / weight.sum().clamp(min=1e-6)
 
 
 class SpanLoss:
@@ -257,24 +269,40 @@ class SpanLoss:
         l_dfl = out["cls"][0].new_zeros(())
         l_qual = out["cls"][0].new_zeros(())
 
+        # Every boundary term below is computed *densely* and then weighted by
+        # `bw`, which is already zero off the positives. The obvious alternative
+        # - `x[sel]` with a boolean mask - is what this used to do, and it costs
+        # a device synchronisation per level per step: advanced indexing has to
+        # copy the mask's popcount back to the host before it can size the
+        # output. Five levels plus the guards above came to ~16 stalls a step, in
+        # a file whose own docstring promises none. The dense form is a handful
+        # of extra elementwise ops on <7k points and issues no sync at all.
         for lvl in range(len(masks)):
             m = masks[lvl]
             l_cls = l_cls + sigmoid_focal(out["cls"][lvl], tgt["cls"][lvl],
                                           m.unsqueeze(-1))
             sel = tgt["pos"][lvl] > 0.5
-            if not bool(sel.any()):
-                continue
-            bw = tgt["bw"][lvl][sel]                        # gold 1.0, silver 0.25
-            ps = out["d_start"][lvl][sel]
-            pe = out["d_end"][lvl][sel]
-            ts = tgt["d_start"][lvl][sel]
-            te = tgt["d_end"][lvl][sel]
+            bw = tgt["bw"][lvl] * sel                       # gold 1.0, silver 0.25
+            # Non-positive points are given a self-consistent unit interval so
+            # DIoU evaluates to exactly 0 with a finite gradient there. Leaving
+            # their real values in risks 0 * inf -> NaN under fp16 when a
+            # degenerate span makes the enclosing interval vanish.
+            one = torch.ones_like(bw)
+            ps = torch.where(sel, out["d_start"][lvl], one)
+            pe = torch.where(sel, out["d_end"][lvl], one)
+            ts = torch.where(sel, tgt["d_start"][lvl], one)
+            te = torch.where(sel, tgt["d_end"][lvl], one)
             l_reg = l_reg + (diou_1d(ps, pe, ts, te) * bw).sum()
-            l_dfl = l_dfl + ((distribution_focal(out["start_logits"][lvl][sel], ts)
-                              + distribution_focal(out["end_logits"][lvl][sel], te))
-                             * bw).sum()
+
+            B, T = bw.shape
+            nb = out["start_logits"][lvl].size(-1)
+            dfl = (distribution_focal(out["start_logits"][lvl].reshape(B * T, nb),
+                                      ts.reshape(B * T))
+                   + distribution_focal(out["end_logits"][lvl].reshape(B * T, nb),
+                                        te.reshape(B * T)))
+            l_dfl = l_dfl + (dfl.view(B, T) * bw).sum()
             l_qual = l_qual + (F.binary_cross_entropy_with_logits(
-                out["quality"][lvl][sel], tgt["quality"][lvl][sel],
+                out["quality"][lvl], tgt["quality"][lvl],
                 reduction="none") * bw).sum()
 
         l_cls = l_cls / n_pos
@@ -294,7 +322,7 @@ class SpanLoss:
         l_frame = (frame_bce * fw).sum() / fw.sum().clamp(min=1)
 
         agn_t = batch["frame_target"].amax(-1)
-        l_dice = soft_dice(out["agn_logits"], agn_t, vmask * fw.view(-1, 1))
+        l_dice = soft_dice(out["agn_logits"], agn_t, vmask, fw)
 
         # clip_probs is a weighted sum of per-frame sigmoids (AttentionPool), not
         # a single logit, so BCEWithLogits does not apply here. Plain BCE is banned
@@ -304,13 +332,15 @@ class SpanLoss:
                 out["clip_probs"].float(), batch["clip_target"].float())
 
         has_vad = batch.get("has_vad")
-        if has_vad is not None and bool(has_vad.any()):
+        if has_vad is None:
+            l_speech = out["cls"][0].new_zeros(())
+        else:
+            # No `has_vad.any()` guard: the clamp already makes an all-zero batch
+            # contribute exactly zero, and the guard would cost another sync.
             sb = F.binary_cross_entropy_with_logits(
                 out["speech_logits"], batch["speech_target"], reduction="none")
             sb = (sb * vmask).sum(1) / vmask.sum(1).clamp(min=1)
             l_speech = (sb * has_vad).sum() / has_vad.sum().clamp(min=1)
-        else:
-            l_speech = out["cls"][0].new_zeros(())
 
         cnt = batch["n_events"].clamp(max=out["count_logits"].size(1) - 1)
         ce = F.cross_entropy(out["count_logits"], cnt, reduction="none")

@@ -62,10 +62,12 @@ class ConvTransformerBlock(nn.Module):
         # A fully padded row would make softmax produce NaN across the whole row.
         # Clips are never entirely padding, but AMP plus an all-masked tail row
         # in a ragged batch can still produce one; force-allow position 0 there.
+        # Done unconditionally: `if allpad.any()` reads a bool off the device and
+        # stalls the pipeline once per block per step, which for six blocks is a
+        # worse deal than one always-taken clone.
         allpad = pad.all(dim=1)
-        if allpad.any():
-            pad = pad.clone()
-            pad[allpad, 0] = False
+        pad = pad.clone()
+        pad[:, 0] = pad[:, 0] & ~allpad
         a, _ = self.attn(h, h, h, key_padding_mask=pad, need_weights=False)
         x = x + self.drop(a)
         x = x + self.ff(self.norm2(x))
@@ -232,9 +234,14 @@ def decode_spans(out: dict, n_frames: int, fps: float) -> Tuple[torch.Tensor, to
         agn = prob[..., -1]                                     # class-agnostic head
         percls = prob[..., :-1]
         cid = percls.argmax(dim=-1)
-        # Geometric mean of actionness and quality: quality is what suppresses
-        # points that sit inside an event but far from its centre, where the
-        # boundary regression is least reliable.
+        # actionness * sqrt(quality). Quality is what suppresses points that sit
+        # inside an event but far from its centre, where the boundary regression
+        # is least reliable; the square root keeps it a tie-breaker rather than
+        # letting it override actionness outright. (Written as the product of two
+        # square roots, which reads like a geometric mean and is not one - the
+        # `agn` factor appears in both halves. Left as-is because the exponents
+        # are the operating point every threshold downstream was chosen against;
+        # only the comment was wrong.)
         sc = (agn * q.sigmoid()).clamp(min=1e-6).sqrt() * agn.sqrt()
         sc = sc * m
         spans.append(torch.stack([start, end], dim=-1))

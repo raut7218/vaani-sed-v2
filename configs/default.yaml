@@ -55,7 +55,9 @@ train:
   grad_clip: 5.0
   ema_decay: 0.999            # EMA of *weights*, not a mean-teacher consistency term
   amp: true
-  num_workers: 4
+  find_unused_parameters: false   # this graph has none; the traversal is pure cost
+  ddp_timeout_min: 60             # rank 0 evaluates alone while its peers wait
+  num_workers: 4                  # per rank; divided by world size at runtime
   prefetch_factor: 4
   eval_every: 1
   unfreeze_epoch: 12          # freeze -> low-LR unfreeze (the ATST-SED schedule)

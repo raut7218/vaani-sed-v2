@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -53,14 +54,25 @@ def log(*a):
         print(*a, flush=True)
 
 
-def setup_ddp() -> tuple:
+def setup_ddp(timeout_min: int = 60) -> tuple:
+    """Returns (device, ddp, rank, world_size).
+
+    The process-group timeout is raised well above the 10 min NCCL default on
+    purpose. Validation runs on rank 0 alone - two full passes over the val set,
+    one for the EMA weights and one for the raw ones - while every other rank
+    sits in a collective waiting for it. At the default timeout a val set large
+    enough to take eleven minutes does not slow the run down, it kills it, with a
+    watchdog abort that looks nothing like the eval being slow.
+    """
     if "RANK" in os.environ and torch.cuda.is_available():
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl",
+                                timeout=timedelta(minutes=max(1, int(timeout_min))))
         local = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local)
-        return torch.device("cuda", local), True
+        return (torch.device("cuda", local), True,
+                dist.get_rank(), dist.get_world_size())
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return dev, False
+    return dev, False, 0, 1
 
 
 def clone_module(model: torch.nn.Module) -> torch.nn.Module:
@@ -114,9 +126,12 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model):
-        src = [v for v in _unwrap(model).state_dict().values() if v.dtype.is_floating_point]
+        # `self._src` holds the live parameter/buffer tensors themselves, paired
+        # once in __init__. Rebuilding the list from `state_dict()` on every step
+        # - which is what this did - walks the whole module tree and allocates an
+        # OrderedDict per iteration to arrive at the same tensor references.
         torch._foreach_mul_(self._dst, self.decay)
-        torch._foreach_add_(self._dst, src, alpha=1.0 - self.decay)
+        torch._foreach_add_(self._dst, self._src, alpha=1.0 - self.decay)
 
 
 def _unwrap(m):
@@ -139,23 +154,39 @@ def build_refs(loader, fps: float) -> dict:
 
 
 def make_param_groups(model, lr: float, enc_scale: float, wd: float):
-    enc, rest, nodecay = [], [], []
+    """Param groups, each carrying its own `base_lr` for the schedule to scale.
+
+    The base LR lives on the group rather than in a positional list next to the
+    training loop: the number of groups changes when the encoders unfreeze, and a
+    `zip(param_groups, [lr, lr, lr * scale])` silently stops updating any group
+    past the third.
+
+    Norms and biases are excluded from weight decay *inside* the encoder group
+    too. Decaying a pretrained LayerNorm's gain toward zero is a slow way to
+    erase the statistics the checkpoint was trained with.
+    """
+    enc, enc_nd, rest, nodecay = [], [], [], []
     for n, p in _unwrap(model).named_parameters():
         if not p.requires_grad:
             continue
+        flat = p.ndim <= 1 or n.endswith(".bias")
         if n.startswith("encoder.encoders"):
-            enc.append(p)
-        elif p.ndim <= 1 or n.endswith(".bias"):
+            (enc_nd if flat else enc).append(p)
+        elif flat:
             nodecay.append(p)
         else:
             rest.append(p)
     groups = [{"params": rest, "lr": lr, "weight_decay": wd},
               {"params": nodecay, "lr": lr, "weight_decay": 0.0}]
+    # A pretrained encoder that gets the head's LR forgets what it knew within an
+    # epoch; this is the single most common way fine-tuning a foundation model on
+    # a small corpus goes wrong.
     if enc:
-        # A pretrained encoder that gets the head's LR forgets what it knew
-        # within an epoch; this is the single most common way fine-tuning a
-        # foundation model on a small corpus goes wrong.
         groups.append({"params": enc, "lr": lr * enc_scale, "weight_decay": wd})
+    if enc_nd:
+        groups.append({"params": enc_nd, "lr": lr * enc_scale, "weight_decay": 0.0})
+    for g in groups:
+        g["base_lr"] = g["lr"]
     return groups
 
 
@@ -196,9 +227,12 @@ def main() -> None:
     if args.no_encoders:
         cfg["model"]["encoders"] = []
 
-    device, ddp = setup_ddp()
-    torch.manual_seed(cfg["seed"])
-    np.random.seed(cfg["seed"])
+    device, ddp, rank, world = setup_ddp(int(cfg["train"].get("ddp_timeout_min", 60)))
+    # Rank-offset so the augmentation RNG differs across ranks. Seeding all ranks
+    # identically (as before) meant the DataLoader's per-worker base seed matched
+    # too, so even the augmentation applied to a batch was byte-identical.
+    torch.manual_seed(cfg["seed"] + rank)
+    np.random.seed(cfg["seed"] + rank)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
@@ -233,21 +267,44 @@ def main() -> None:
     va_ds = VaaniSpanDataset(va_recs, train=False, augment=False, **ds_kw)
 
     bs = int(t["batch_size"])
-    nw = min(int(t.get("num_workers", 4)), os.cpu_count() or 2)
-    sampler = TierBatchSampler(tr_recs, bs, t.get("tier_quotas"), seed=cfg["seed"])
+    # Workers are per *process*, and under torchrun there is one process per GPU.
+    # Taking os.cpu_count() as the budget for each of them oversubscribes the host
+    # by `world` times over, and on a 4-vCPU box that is how a GPU job ends up
+    # input-bound.
+    nw = max(0, min(int(t.get("num_workers", 4)), (os.cpu_count() or 2) // world))
+    # The sampler seed stays identical across ranks on purpose: every rank builds
+    # the same global batch list and then takes its own disjoint slice of it.
+    sampler = TierBatchSampler(tr_recs, bs, t.get("tier_quotas"), seed=cfg["seed"],
+                               rank=rank, world_size=world)
+    gen = torch.Generator()
+    gen.manual_seed(int(cfg["seed"]) + 1000 * rank)     # per-rank worker seeds
     tr_ld = DataLoader(tr_ds, batch_sampler=sampler, num_workers=nw,
-                       collate_fn=collate, pin_memory=True,
+                       collate_fn=collate, pin_memory=True, generator=gen,
                        persistent_workers=nw > 0,
                        prefetch_factor=int(t.get("prefetch_factor", 4)) if nw else None)
     va_ld = DataLoader(va_ds, batch_size=bs, shuffle=False, num_workers=nw,
                        collate_fn=collate, pin_memory=True,
                        persistent_workers=nw > 0)
+    # Reference spans need the label tensors only, so this loader skips the audio
+    # decode entirely rather than reading every validation clip off disk.
+    ref_ld = DataLoader(
+        VaaniSpanDataset(va_recs, train=False, augment=False, labels_only=True,
+                         **ds_kw),
+        batch_size=bs, shuffle=False, num_workers=nw, collate_fn=collate)
 
     enc = build_encoder(m, ckpt_dir=m.get("beats_dir", "checkpoints"))
     model = build_model(cfg, len(le), enc).to(device)
-    if ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[device.index], find_unused_parameters=True)
+    # `find_unused_parameters` defaults off: torch itself reports that this graph
+    # has no unused parameters, and leaving the flag on buys an extra traversal of
+    # the autograd graph every iteration for nothing.
+    def wrap_ddp(net):
+        if not ddp:
+            return net
+        return torch.nn.parallel.DistributedDataParallel(
+            _unwrap(net), device_ids=[device.index],
+            find_unused_parameters=bool(t.get("find_unused_parameters", False)))
+
+    model = wrap_ddp(model)
 
     crit = SpanLoss(cfg, len(le), int(m.get("n_bins", 16)))
     lr = float(t["lr"])
@@ -282,31 +339,63 @@ def main() -> None:
         st = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         if int(st.get("unfroze_at_epoch", 0)):
             # Rebuild the trainable set *before* loading the optimiser, or the
-            # param groups will not line up with the saved state.
+            # param groups will not line up with the saved state. Re-wrap for the
+            # same reason as the in-loop unfreeze: DDP's reducer only ever sees
+            # the parameters that were trainable when it was built.
             _unwrap(model).encoder.unfreeze_last(int(t.get("unfreeze_blocks", 0)))
+            model = wrap_ddp(model)
             opt = torch.optim.AdamW(
                 make_param_groups(model, lr, float(t.get("encoder_lr_scale", 0.05)),
                                   float(t["weight_decay"])))
         _unwrap(model).load_state_dict(st["model"])
+        base_lrs = [g["base_lr"] for g in opt.param_groups]
         opt.load_state_dict(st["opt"])
+        # `load_state_dict` replaces param_groups wholesale, so re-stamp the base
+        # LRs it does not know about (a checkpoint written before they existed
+        # carries none at all).
+        for g, b in zip(opt.param_groups, base_lrs):
+            g["base_lr"] = b
         scaler.load_state_dict(st["scaler"])
         # In-place copy, so the EMA's cached tensor references stay valid.
         ema.shadow.load_state_dict(st["ema"])
         step, best = int(st["step"]), float(st["best"])
+        # Steps-per-epoch is not a constant across code versions - enabling rank
+        # sharding halves it on a 2-GPU job - and the cosine schedule is indexed
+        # by raw step count. Carried over unscaled, a step counter from a run with
+        # twice as many steps per epoch lands past the end of the new schedule,
+        # where cosine_lr clamps to exactly 0 and training silently continues at
+        # zero LR. Rescale by the ratio of totals so the *fraction* of the
+        # schedule already consumed is what survives the resume.
+        old_total = int(st.get("total_steps", 0))
+        if old_total and old_total != total_steps:
+            step = int(round(step * total_steps / old_total))
+            log("[resume] steps-per-epoch changed; rescaled step %d -> %d"
+                % (int(st["step"]), step))
         history = st.get("history", [])
         start_epoch = int(st["epoch"]) + 1
         log("[resume] %s -> epoch %d, step %d, best %.4f"
             % (resume_path, start_epoch, step, best))
 
-    refs = build_refs(va_ld, float(d["fps"])) if is_main() else {}
+    refs = build_refs(ref_ld, float(d["fps"])) if is_main() else {}
+
+    clip_params = [p for g in opt.param_groups for p in g["params"]]
 
     for epoch in range(start_epoch, epochs + 1):
         if epoch == unfreeze_at + 1 and int(t.get("unfreeze_blocks", 0)) > 0:
             got = _unwrap(model).encoder.unfreeze_last(int(t["unfreeze_blocks"]))
             log("[train] unfroze top blocks per encoder: %s" % got)
+            # DDP fixes its gradient buckets from the parameters that had
+            # `requires_grad` at construction time, so parameters unfrozen later
+            # are never registered with the reducer: their gradients are computed
+            # locally and never all-reduced, and the ranks drift apart into
+            # different encoders from this epoch on. Rebuilding the wrapper is
+            # what puts them back in. Tensor identity is unchanged, so the EMA's
+            # cached pairing survives.
+            model = wrap_ddp(model)
             opt = torch.optim.AdamW(
                 make_param_groups(model, lr, float(t.get("encoder_lr_scale", 0.05)),
                                   float(t["weight_decay"])))
+            clip_params = [p for g in opt.param_groups for p in g["params"]]
 
         model.train()
         acc, nb, t0 = {}, 0, time.time()
@@ -315,9 +404,8 @@ def main() -> None:
                 if torch.is_tensor(v):
                     batch[k] = v.to(device, non_blocking=True)
             f = cosine_lr(step, total_steps, warmup)
-            for g, base in zip(opt.param_groups,
-                               [lr, lr, lr * float(t.get("encoder_lr_scale", 0.05))]):
-                g["lr"] = base * f
+            for g in opt.param_groups:
+                g["lr"] = g["base_lr"] * f
 
             with torch.autocast(device_type=device.type,
                                 enabled=bool(t.get("amp", True)) and device.type == "cuda"):
@@ -327,9 +415,7 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(
-                [p for g in opt.param_groups for p in g["params"]],
-                float(t.get("grad_clip", 5.0)))
+            torch.nn.utils.clip_grad_norm_(clip_params, float(t.get("grad_clip", 5.0)))
             scaler.step(opt)
             scaler.update()
             ema.update(model)
@@ -372,11 +458,19 @@ def main() -> None:
             torch.save({"model": _unwrap(model).state_dict(),
                         "opt": opt.state_dict(), "scaler": scaler.state_dict(),
                         "ema": ema.shadow.state_dict(), "step": step, "best": best,
+                        "total_steps": total_steps,
                         "epoch": epoch, "history": history, "cfg": cfg,
                         "unfroze_at_epoch": epoch > unfreeze_at
                         and int(t.get("unfreeze_blocks", 0)) > 0},
                        tmp)
             tmp.replace(out_dir / "state.pt")
+
+        # Every rank waits here for rank 0's evaluation and checkpoint write.
+        # Without it the other ranks roll straight into the next epoch and block
+        # inside a backward all-reduce instead, which is the same wait dressed up
+        # as a collective that can time out.
+        if ddp:
+            dist.barrier()
 
     log("[done] best val score %.4f -> %s" % (best, out_dir / "best.pt"))
     if ddp:
