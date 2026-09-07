@@ -321,6 +321,7 @@ def main() -> None:
     out = Path(args.out)
     (out / "audio").mkdir(parents=True, exist_ok=True)
     man_path = out / "manifest.jsonl"
+    shards_done_path = out / "shards_done.json"
 
     done = set()
     if man_path.exists():
@@ -331,6 +332,22 @@ def main() -> None:
                 except Exception:  # noqa: BLE001
                     pass
         print("[download] resuming: %d clips already in the manifest" % len(done))
+
+    # Shards fully materialised in a previous run of this script against the
+    # same --out are never fetched again. Per-clip resume (via `done` above)
+    # already skips re-*writing* a clip, but without this a resumed run still
+    # re-downloads every earlier shard's ~100 MB blob from the Hub just to
+    # discover every row in it is already done - which is most of the cost of
+    # a full re-download for no benefit.
+    shards_done = set()
+    if shards_done_path.exists():
+        try:
+            shards_done = set(json.loads(shards_done_path.read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001
+            shards_done = set()
+    if shards_done:
+        print("[download] %d shard(s) already fully materialised - will not be "
+              "re-fetched" % len(shards_done))
 
     gold_ids = set()
     if args.gold_ids and Path(args.gold_ids).exists():
@@ -348,6 +365,10 @@ def main() -> None:
     with man_path.open("a", encoding="utf-8") as fout:
         for fi, meta in enumerate(shards):
             rel = meta["path"]
+            if rel in shards_done:
+                print("[download] shard %d/%d  %s - already materialised, skipping"
+                      % (fi + 1, len(shards), Path(rel).name))
+                continue
             print("[download] shard %d/%d  %s (%s)"
                   % (fi + 1, len(shards), Path(rel).name, human(meta["size"])))
             try:
@@ -425,6 +446,14 @@ def main() -> None:
                 if stop:
                     break
             fout.flush()
+
+            if not stop:
+                # Every row in this shard has been seen (written or already-done),
+                # so it never needs fetching again. Not marked when `stop` fired
+                # (--limit cut the shard off mid-way) - that shard is incomplete.
+                shards_done.add(rel)
+                shards_done_path.write_text(
+                    json.dumps(sorted(shards_done)), encoding="utf-8")
 
             if not args.keep_parquet:
                 # Free the ~100 MB blob now the shard is materialised. Across 182

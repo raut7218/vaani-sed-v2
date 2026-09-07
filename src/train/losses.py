@@ -296,7 +296,12 @@ class SpanLoss:
         agn_t = batch["frame_target"].amax(-1)
         l_dice = soft_dice(out["agn_logits"], agn_t, vmask * fw.view(-1, 1))
 
-        l_clip = F.binary_cross_entropy(out["clip_probs"], batch["clip_target"])
+        # clip_probs is a weighted sum of per-frame sigmoids (AttentionPool), not
+        # a single logit, so BCEWithLogits does not apply here. Plain BCE is banned
+        # under autocast (unsafe in fp16), so run this one term in fp32 explicitly.
+        with torch.autocast(device_type=out["clip_probs"].device.type, enabled=False):
+            l_clip = F.binary_cross_entropy(
+                out["clip_probs"].float(), batch["clip_target"].float())
 
         has_vad = batch.get("has_vad")
         if has_vad is not None and bool(has_vad.any()):
