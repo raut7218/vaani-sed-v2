@@ -285,6 +285,60 @@ def test_district():
 # --------------------------------------------------------------------------- #
 # EMA over an encoder that uses weight_norm
 # --------------------------------------------------------------------------- #
+def test_save_atomic():
+    """A failed checkpoint write must leave the previous one intact.
+
+    The session this guards against died at `torch.save` with ENOSPC and, saving
+    in place, left a truncated `best.pt` behind - two epochs of GPU time turned
+    into a file nothing can load. The rename makes the swap all-or-nothing.
+    """
+    import tempfile
+    from src.train.train import save_atomic
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "best.pt"
+        save_atomic({"score": 1.0}, p)
+        check("save_atomic: writes", p.exists() and torch.load(p, weights_only=False)["score"] == 1.0)
+
+        class Unpicklable:
+            def __reduce__(self):
+                raise OSError(28, "No space left on device")
+
+        try:
+            save_atomic({"score": 2.0, "bad": Unpicklable()}, p)
+            failed = False
+        except RuntimeError as e:
+            failed = "No space left" in str(e) and "GB free" in str(e)
+        check("save_atomic: a failed write raises, and says why", failed)
+        check("save_atomic: the previous checkpoint survives",
+              torch.load(p, weights_only=False)["score"] == 1.0)
+        check("save_atomic: no .tmp left behind",
+              not (Path(d) / "best.pt.tmp").exists())
+
+
+def test_preflight_projection():
+    """Two shards must extrapolate to the whole corpus, and refuse when it will not fit."""
+    import tempfile
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from preflight import budget, du
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "audio"
+        root.mkdir()
+        (root / "a.bin").write_bytes(b"x" * 1000)
+        (root / "b.bin").write_bytes(b"x" * 500)
+        check("preflight: du sums a tree", du(root) == 1500)
+        check("preflight: du of a missing path is 0", du(Path(d) / "nope") == 0)
+        # Off Kaggle the budget is just the filesystem's; either way it is a
+        # count of bytes, and a negative one would make every projection pass.
+        check("preflight: budget is non-negative", budget(Path(d)) >= 0)
+
+    # 2 of 182 shards, so x91 - the arithmetic the STOP message is built on.
+    audio_now, on_server, done = 1500, 182, 2
+    scale = on_server / float(done)
+    check("preflight: extrapolates by shard count", abs(audio_now * scale - 136500) < 1)
+
+
 def test_ema_weight_norm():
     """The EMA must be able to clone a model carrying `weight_norm`.
 
@@ -402,6 +456,8 @@ if __name__ == "__main__":
     test_nms_and_fusion()
     test_district()
     test_ema_weight_norm()
+    test_save_atomic()
+    test_preflight_projection()
     test_atst_encoder()
     print("\n%d/%d checks passed" % (sum(OK), len(OK)))
     sys.exit(0 if all(OK) else 1)

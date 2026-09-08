@@ -22,6 +22,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from datetime import timedelta
@@ -136,6 +137,34 @@ class EMA:
 
 def _unwrap(m):
     return m.module if hasattr(m, "module") else m
+
+
+def save_atomic(obj, path: Path) -> None:
+    """torch.save via a temp file + rename, so a failed write keeps the old file.
+
+    A full disk aborts `torch.save` *mid-record*, and torch reports it as
+    `unexpected pos 27320320 vs 27320208` - which reads like a corrupt tensor,
+    not like ENOSPC. Writing in place then means the session ends with a
+    truncated `best.pt`, i.e. with nothing: the previous epoch's good checkpoint
+    was already overwritten. The rename makes the swap all-or-nothing, and the
+    free-space figure below turns the enforce-fail into the sentence that
+    actually names the problem.
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(obj, tmp)
+        tmp.replace(path)
+    except Exception as e:  # noqa: BLE001 - re-raised; this only adds the reason
+        tmp.unlink(missing_ok=True)
+        free = shutil.disk_usage(path.parent).free / float(1 << 30)
+        raise RuntimeError(
+            "could not write %s (%.2f GB free): %s\n"
+            "Under ~1 GB free this is the disk, whatever the message says - the "
+            "corpus, the VAD labels and the synthetic audio together outgrew the "
+            "working quota. `scripts/preflight.py` projects that before the "
+            "download; %s was left as it was."
+            % (path, free, e, path.name)) from e
 
 
 def build_refs(loader, fps: float) -> dict:
@@ -443,27 +472,25 @@ def main() -> None:
                        r["tp"], r["fp"], r["fn"]))
                 if r["score"] > best:
                     best = r["score"]
-                    torch.save({"model": net.state_dict(), "cfg": cfg,
-                                "classes": le.classes, "score": best,
-                                "which": name, "epoch": epoch},
-                               out_dir / "best.pt")
+                    save_atomic({"model": net.state_dict(), "cfg": cfg,
+                                 "classes": le.classes, "score": best,
+                                 "which": name, "epoch": epoch},
+                                out_dir / "best.pt")
             (out_dir / "history.json").write_text(json.dumps(history, indent=1),
                                                   encoding="utf-8")
-            torch.save({"model": _unwrap(model).state_dict(), "cfg": cfg,
-                        "classes": le.classes, "epoch": epoch}, out_dir / "last.pt")
-            # Full resume state, written every epoch. Written to a temp name and
-            # renamed so a session killed mid-write leaves the previous state
-            # intact rather than a truncated file.
-            tmp = out_dir / "state.pt.tmp"
-            torch.save({"model": _unwrap(model).state_dict(),
-                        "opt": opt.state_dict(), "scaler": scaler.state_dict(),
-                        "ema": ema.shadow.state_dict(), "step": step, "best": best,
-                        "total_steps": total_steps,
-                        "epoch": epoch, "history": history, "cfg": cfg,
-                        "unfroze_at_epoch": epoch > unfreeze_at
-                        and int(t.get("unfreeze_blocks", 0)) > 0},
-                       tmp)
-            tmp.replace(out_dir / "state.pt")
+            save_atomic({"model": _unwrap(model).state_dict(), "cfg": cfg,
+                         "classes": le.classes, "epoch": epoch}, out_dir / "last.pt")
+            # Full resume state, written every epoch, so a session killed
+            # mid-write leaves the previous state intact rather than a truncated
+            # file.
+            save_atomic({"model": _unwrap(model).state_dict(),
+                         "opt": opt.state_dict(), "scaler": scaler.state_dict(),
+                         "ema": ema.shadow.state_dict(), "step": step, "best": best,
+                         "total_steps": total_steps,
+                         "epoch": epoch, "history": history, "cfg": cfg,
+                         "unfroze_at_epoch": epoch > unfreeze_at
+                         and int(t.get("unfreeze_blocks", 0)) > 0},
+                        out_dir / "state.pt")
 
         # Every rank waits here for rank 0's evaluation and checkpoint write.
         # Without it the other ranks roll straight into the next epoch and block

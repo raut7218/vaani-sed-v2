@@ -68,7 +68,7 @@ git clone https://github.com/raut7218/vaani-sed-v2.git && cd vaani-sed-v2
 pip install -r requirements.txt
 
 python scripts/smoke_test.py          # end-to-end on synthetic audio, ~2 min, no GPU
-python tests/test_components.py       # 42 checks
+python tests/test_components.py       # 67 checks
 python tests/test_overfit.py          # proves the head is time-aligned to the audio
 ```
 
@@ -76,6 +76,13 @@ Then the real thing:
 
 ```bash
 python scripts/fetch_encoders.py --all                    # BEATs + ATST-Frame
+
+# Dry run first: two real shards through every stage below, then a projection of
+# what all 182 will cost on disk. Minutes, and it is the difference between
+# finding a problem now and finding it after an hour of download and two epochs
+# of GPU time. The two shards it fetches are kept.
+python scripts/preflight.py --data data/vaani --config configs/default.yaml
+
 python scripts/download_data.py --out data/vaani          # 182 shards, 154.6 h, gated
 python scripts/make_vad.py --data data/vaani              # speech pseudo-labels
 python scripts/make_synthetic.py --data data/vaani --out data/vaani_synth -n 20000
@@ -278,6 +285,7 @@ scripts/fetch_encoders.py     vendor BEATs + ATST-Frame
 scripts/download_data.py      HF -> wavs + manifest + tier assignment
 scripts/make_vad.py           speech pseudo-labels for the auxiliary head
 scripts/make_synthetic.py     bronze tags -> strong labels by construction
+scripts/preflight.py          2 shards end to end + a disk projection, before the download
 scripts/diagnose.py           where the score is going, not just what it is
 scripts/smoke_test.py         end-to-end on synthetic audio
 src/models/encoders.py        ATST-Frame / BEATs / WavLM + fusion

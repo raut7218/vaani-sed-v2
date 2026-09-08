@@ -169,9 +169,14 @@ def main() -> None:
             buf = buf / peak * 0.98
 
         uid = "synth_%06d" % i
-        sf.write(str(out / "audio" / (uid + ".wav")), buf, args.sr)
+        # flac, like the downloaded corpus, and lossless either way: 20k x 8 s of
+        # 16 kHz PCM is 5.1 GB as wav, and on a 20 GB working quota that already
+        # holds the corpus and the VAD labels, what flac saves off that is the
+        # difference between the run finishing and ENOSPC at the first
+        # checkpoint. `scripts/preflight.py` measures the real figure.
+        sf.write(str(out / "audio" / (uid + ".flac")), buf, args.sr)
         man.write(json.dumps({
-            "uid": uid, "path": "audio/%s.wav" % uid,
+            "uid": uid, "path": "audio/%s.flac" % uid,
             "duration": round(args.clip_len, 4),
             # Boundaries are exact by construction, so this is genuinely gold.
             "tier": "gold", "state": "SYNTH", "district": "SYNTH",
