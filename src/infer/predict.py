@@ -18,7 +18,6 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-import yaml
 from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))

@@ -43,7 +43,7 @@ Reproduce any of these on your own checkpoint with `scripts/diagnose.py`.
 
 | | v1 | v2 | Why |
 |---|---|---|---|
-| **Primary encoder** | frozen BEATs, **160 ms** patches | **ATST-Frame, 40 ms**, fine-tuned; BEATs demoted to a semantic side-channel; WavLM optional | The metric's 10th-percentile tolerance is **59 ms**. BEATs is ~3× too coarse, and v1 then linearly interpolated those tokens up to a 40 ms grid. BEATs is good at *what*; ATST is good at *when*. |
+| **Primary encoder** | frozen BEATs, **160 ms** patches | **ATST-Frame, 40 ms**, fine-tuned; BEATs demoted to a semantic side-channel | The metric's 10th-percentile tolerance is **59 ms**. BEATs is ~3× too coarse, and v1 then linearly interpolated those tokens up to a 40 ms grid. BEATs is good at *what*; ATST is good at *when*. |
 | **Encoder training** | frozen forever | staged: frozen → top-4 blocks at 5% LR | v1 justified freezing by "22 h gold, Colab time". The corpus is 154 h and Kaggle gives 2×T4. Staged fine-tuning is the ATST-SED recipe. |
 | **Output** | per-frame posterior | **anchor-free span regression** with distributional boundaries | Measurement 4. Boundaries are *regressed*, never read off a level set. |
 | **Boundary representation** | implicit in the threshold | 16-bin distribution per boundary, expectation = the value | Continuous output on a discrete grid. Verified: the head places boundaries to **5.2 ms** on deliberately off-grid targets (`tests/test_overfit.py`). |
@@ -77,12 +77,6 @@ Then the real thing:
 ```bash
 python scripts/fetch_encoders.py --all                    # BEATs + ATST-Frame
 
-# Dry run first: two real shards through every stage below, then a projection of
-# what all 182 will cost on disk. Minutes, and it is the difference between
-# finding a problem now and finding it after an hour of download and two epochs
-# of GPU time. The two shards it fetches are kept.
-python scripts/preflight.py --data data/vaani --config configs/default.yaml
-
 python scripts/download_data.py --out data/vaani          # 182 shards, 154.6 h, gated
 python scripts/make_vad.py --data data/vaani              # speech pseudo-labels
 python scripts/make_synthetic.py --data data/vaani --out data/vaani_synth -n 20000
@@ -96,25 +90,30 @@ python -m src.infer.predict --ckpt runs/f0/best.pt --audio-dir data/test --out s
 
 ### On Kaggle
 
-Open [`notebooks/Vaani_Track1_v2_Kaggle.ipynb`](notebooks/Vaani_Track1_v2_Kaggle.ipynb).
-Everything you need to edit is in one CONFIG cell at the top. Set the accelerator to
-**GPU T4 x2**, turn Internet on, and add `HF_TOKEN` under *Add-ons → Secrets* (the
-dataset is gated).
+Two notebooks, both on **GPU T4 x2** with Internet on:
+
+1. [`notebooks/Vaani_Data_Kaggle.ipynb`](notebooks/Vaani_Data_Kaggle.ipynb) — **once**.
+   Downloads the corpus (gated: paste an `HF_TOKEN` or attach the secret), runs VAD and
+   synthesis, and packs everything with `scripts/pack_data.py` into ~10 large files.
+   Kaggle saves at most 500 output files and the prepared corpus is ~110k, so without
+   packing every session spent its first hour re-downloading 16.5 GB.
+2. [`notebooks/Vaani_Track1_v2_Kaggle.ipynb`](notebooks/Vaani_Track1_v2_Kaggle.ipynb) —
+   training and submission. *Add Data → Your Work → vaani-data*; the CONFIG cell finds
+   the packed corpus on its own.
 
 `--batch-size` is **per GPU**, the standard DDP convention:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m src.train.train \
-    --config configs/default.yaml --data data/vaani --out runs/f0 --batch-size 16
+    --config configs/default.yaml --data data/vaani --out runs/f0 --batch-size 48
 ```
 
-A Kaggle GPU session stops at ~12 h and 60 epochs over 154 h of audio will not fit in
-one, so training writes `state.pt` every epoch and resumes losslessly:
+Training writes `state.pt` every epoch and resumes losslessly if a session runs out:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m src.train.train \
     --config configs/default.yaml --data data/vaani --out runs/f0 \
-    --batch-size 16 --resume auto
+    --batch-size 48 --resume auto
 ```
 
 `--resume auto` restores the model, optimiser, GradScaler, EMA shadow, history and —
@@ -155,13 +154,37 @@ less accurately.
 
 ---
 
+## Throughput on 2×T4
+
+What a training step and a validation pass cost, and why:
+
+| | Before | Now |
+|---|---|---|
+| Attention in both encoders | explicit `softmax(q·kᵀ)`; BEATs promotes every (B,12,392,392) score tensor to fp32 | fused `scaled_dot_product_attention` (memory-efficient kernel), same maths, tested equal to 1e-6 |
+| BEATs input | per-clip Kaldi fbank in a Python loop | one batched fbank, tested equal to torchaudio |
+| Unfrozen phase | whole encoder under activation checkpointing, then grad accumulation — the frozen 8 blocks were recomputed every step | frozen blocks build no graph; only the top blocks keep activations (`checkpoint_unfrozen` if memory is short) |
+| Validation | rank 0 alone, twice (EMA + raw) over the whole held-out set, every epoch, GPU idle during post-processing | both GPUs, EMA only, CPU post-processing pipelined behind the next batch, `eval_every: 2` + every epoch for the last `eval_last: 10` |
+| EMA | every tensor incl. ~170M frozen encoder parameters, every step | trainable tensors + buffers only |
+| Augmentation | gain + 128k-sample Gaussian noise per clip on 4 shared vCPUs | on the GPU |
+| Checkpoints | `best.pt` + `last.pt` + `state.pt` written synchronously | `best.pt` + `state.pt` from a background thread |
+| Data | re-downloaded, re-VAD'd, re-synthesised every session (~1 h) | packed once, attached as an input |
+
+Two fixes rode along. BEATs' LayerDrop (0.05 in the checkpoint's config) is off: it
+draws per rank, so once the top blocks train it skips a *different* trainable layer on
+each GPU, which DDP cannot reduce. And BEATs' 392 tokens are 49 time steps × 8
+frequency patches, time-major — they were being linearly interpolated to 200 frames as
+if the whole sequence were time, so consecutive output frames each saw a different
+frequency band. The patches are now averaged per time step first.
+
+---
+
 ## Architecture
 
 ```
 waveform 16 kHz
   ├── log-mel @100 fps  +  spectral-flux onset channels ──► CNN ──► 25 fps, 512-d
   │      (time pooled by exactly 4, and only in the first two blocks)
-  └── ATST-Frame (40 ms) ‖ BEATs (160 ms) ‖ WavLM (20 ms) ──► proj 256 each
+  └── ATST-Frame (40 ms) ‖ BEATs (160 ms, freq-pooled) ──► proj 256 each
                                     │
                               concat, 25 fps
                                     │
@@ -229,7 +252,6 @@ Each is one flag or one config line.
 | `--no-encoders` | what the pretrained stack is worth at all |
 | `model.encoders: [beats]` | v1's encoder choice, everything else v2 |
 | `model.encoders: [atst_frame]` | ATST alone vs the fusion |
-| `model.n_basis: 4` | FDY conv (v1's default) vs plain conv |
 | `model.flux: false` | value of the spectral-flux channels |
 | `loss.dice: 0` | training the metric vs training BCE |
 | `loss.dfl: 0` | distributional boundaries vs scalar regression |
@@ -285,15 +307,15 @@ scripts/fetch_encoders.py     vendor BEATs + ATST-Frame
 scripts/download_data.py      HF -> wavs + manifest + tier assignment
 scripts/make_vad.py           speech pseudo-labels for the auxiliary head
 scripts/make_synthetic.py     bronze tags -> strong labels by construction
-scripts/preflight.py          2 shards end to end + a disk projection, before the download
+scripts/pack_data.py          corpus + VAD + synthetic -> a few large files (Kaggle's 500-file cap)
 scripts/diagnose.py           where the score is going, not just what it is
 scripts/smoke_test.py         end-to-end on synthetic audio
-src/models/encoders.py        ATST-Frame / BEATs / WavLM + fusion
+src/models/encoders.py        ATST-Frame / BEATs (fused attention) + fusion
 src/models/frontend.py        log-mel, per-clip norm, spectral flux
 src/models/trident.py         temporal FPN + distributional boundary head
 src/models/span_model.py      the assembled model and its auxiliary heads
 src/train/losses.py           assignment, focal, 1D DIoU, DFL, soft-Dice, tier masks
-src/train/train.py            training loop (DDP, AMP, staged unfreeze)
+src/train/train.py            training loop (DDP, AMP, staged unfreeze, sharded validation)
 src/infer/decode.py           SoftNMS, 1D WBF, count selection
 src/infer/predict.py          -> submission.zip
 src/postproc/calibrate.py     transductive per-district calibration
@@ -311,5 +333,4 @@ Dataset: [Vaani Noise Event Timestamps](https://huggingface.co/datasets/ARTPARK-
 Method references: TriDet (relative boundary modelling), ActionFormer (anchor-free
 temporal localisation), Generalized Focal Loss (distribution focal loss), ATST-SED
 (frame-level pretraining and the staged fine-tuning schedule), and the
-complementary-SSL-fusion result that puts ATST-Frame, BEATs and WavLM in the same
-model.
+complementary-SSL-fusion result that puts ATST-Frame and BEATs in the same model.

@@ -221,7 +221,6 @@ def decode_spans(out: dict, n_frames: int, fps: float) -> Tuple[torch.Tensor, to
     (B, N), and the level each point came from.
     """
     device = out["cls"][0].device
-    B = out["cls"][0].size(0)
     pts = level_points(n_frames, len(out["cls"]), device)
     spans, scores, clses, levels = [], [], [], []
     for lvl, (c, ds, de, q, m) in enumerate(zip(

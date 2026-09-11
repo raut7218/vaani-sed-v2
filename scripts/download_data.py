@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.labels import LabelEncoder  # noqa: E402
 from src.data.prepare import (  # noqa: E402
-    TIER_COLUMNS, UNMAPPED_QUALITY, _lookup, build_record, quality_to_tier)
+    TIER_COLUMNS, UNMAPPED_QUALITY, _lookup, build_record)
 
 REPO = "ARTPARK-IISc/Vaani-Noise-Event-Dataset"
 # The earlier 9-clip sample repo, kept for reference:
@@ -136,109 +136,6 @@ def select_shards(shards: list, max_shards: int, start: int) -> list:
     return shards
 
 
-def _iter_repair_rows(rows: list, rel_name: str, gold_uids: set):
-    """Yield (uid, new_tier) for already-gold uids that resolve to a different
-    tier under the current `quality_to_tier`.
-
-    Pure function over plain row dicts (no HF/pyarrow calls) so the uid
-    derivation and re-classification logic can be unit tested without network
-    access - it must match `main()`'s uid derivation exactly, or a repair run
-    would silently mismatch rows to the wrong clips.
-    """
-    row_i = 0
-    for row in rows:
-        audio = row.get("audio") or {}
-        stem = Path(str(audio.get("path") or "")).stem
-        uid = stem if stem else "%s_%07d" % (Path(rel_name).stem, row_i)
-        row_i += 1
-        if uid not in gold_uids:
-            continue
-        found, q = _lookup(row, TIER_COLUMNS)
-        if not found:
-            continue
-        new_tier = quality_to_tier(q)
-        if new_tier and new_tier != "gold":
-            yield uid, new_tier
-
-
-def repair_tiers(args, token: str | None, shards: list) -> None:
-    """Patch `tier` in an already-materialised manifest.jsonl, no re-download of
-    audio and no re-decoding - only the (small) parquet metadata is re-fetched.
-
-    The substring-matching bug in `quality_to_tier` could only ever misclassify
-    a lower tier's clips as "gold" (never the reverse - "gold" clips could not
-    have been silently demoted), so only clips currently tagged gold need
-    re-checking against the raw annotationQuality column. Everything else
-    (path, events, duration, clip_labels, ...) is left untouched.
-    """
-    from huggingface_hub import hf_hub_download
-    import pyarrow.parquet as pq
-
-    out = Path(args.out)
-    man_path = out / "manifest.jsonl"
-    if not man_path.exists():
-        raise SystemExit("[repair] no manifest.jsonl at %s - nothing to repair" % man_path)
-
-    recs = []
-    with man_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                recs.append(json.loads(line))
-    gold_uids = {r["uid"] for r in recs if r.get("tier") == "gold"}
-    print("[repair] %d clips in manifest, %d currently tagged gold to re-check"
-          % (len(recs), len(gold_uids)))
-    if not gold_uids:
-        print("[repair] nothing tagged gold - nothing to do")
-        return
-
-    fixed = {}
-    for fi, meta in enumerate(shards):
-        rel = meta["path"]
-        print("[repair] shard %d/%d  %s" % (fi + 1, len(shards), Path(rel).name))
-        try:
-            pf_path = hf_hub_download(repo_id=args.repo, filename=rel,
-                                      repo_type="dataset", token=token,
-                                      cache_dir=args.cache or None)
-        except Exception as e:  # noqa: BLE001
-            print("[repair]   FAILED to fetch %s: %s" % (rel, e))
-            continue
-
-        pf = pq.ParquetFile(pf_path)
-        for batch in pf.iter_batches(batch_size=args.batch_rows):
-            for uid, new_tier in _iter_repair_rows(batch.to_pylist(), rel, gold_uids):
-                fixed[uid] = new_tier
-
-        if not args.keep_parquet:
-            try:
-                Path(pf_path).unlink()
-            except OSError:
-                pass
-
-    print("[repair] %d/%d previously-gold clips reclassified: %s"
-          % (len(fixed), len(gold_uids), dict(Counter(fixed.values()))))
-    if not fixed:
-        print("[repair] nothing to change - manifest already correct")
-        return
-
-    for r in recs:
-        nt = fixed.get(r["uid"])
-        if nt:
-            r["tier"] = nt
-    with man_path.open("w", encoding="utf-8") as f:
-        for r in recs:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print("[repair] rewrote %s" % man_path)
-
-    stats_path = out / "stats.json"
-    if stats_path.exists():
-        stats = json.loads(stats_path.read_text(encoding="utf-8"))
-        stats["tiers_after_repair"] = dict(Counter(r["tier"] for r in recs))
-        stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-        print("[repair] updated %s -> tiers_after_repair=%s"
-              % (stats_path, stats["tiers_after_repair"]))
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=REPO)
@@ -258,10 +155,6 @@ def main() -> None:
     ap.add_argument("--expand-vehicle", type=int, default=1)
     ap.add_argument("--list-only", action="store_true",
                     help="show what is on the server and exit, downloading nothing")
-    ap.add_argument("--repair-tiers", action="store_true",
-                    help="patch tier in an existing manifest.jsonl after a "
-                         "quality_to_tier fix, without re-downloading or "
-                         "re-decoding any audio")
     ap.add_argument("--keep-parquet", action="store_true",
                     help="keep the HF cache; by default each shard's blob is deleted "
                          "once materialised, which halves peak disk use")
@@ -307,10 +200,6 @@ def main() -> None:
         est = TARGET_HOURS * 3600 * args.sr * 2 * (0.55 if args.format == "flac" else 1.0)
         print("[download] estimated decoded %s for this selection: ~%s"
               % (args.format, human(est * frac)))
-        return
-
-    if args.repair_tiers:
-        repair_tiers(args, token, shards)
         return
 
     # ---- 2. materialise, one shard at a time --------------------------------

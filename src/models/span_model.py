@@ -27,11 +27,9 @@ annotation.
 """
 from __future__ import annotations
 
-from typing import List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.models.encoders import FusionEncoder
 from src.models.frontend import LogMel, SpecAugment, onset_strength, resample_time

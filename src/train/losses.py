@@ -255,7 +255,6 @@ class SpanLoss:
         self.silver_frame = float(w.get("silver_frame_weight", 0.5))
 
     def __call__(self, out: dict, batch: dict) -> tuple:
-        device = out["cls"][0].device
         tier = batch["tier"]
         masks = out["masks"]
         n_frames = out["base_mask"].size(1)

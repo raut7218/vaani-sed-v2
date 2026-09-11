@@ -402,7 +402,6 @@ def test_ema_skips_frozen():
 
 def test_packed_dataset():
     """A packed corpus must read back exactly what the loose files hold."""
-    import json
     import subprocess
     import tempfile
     from scripts.smoke_test import make_corpus
