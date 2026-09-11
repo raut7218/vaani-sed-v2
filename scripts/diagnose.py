@@ -126,7 +126,7 @@ def main() -> None:
     _, va = split_manifest(recs, fold=args.fold, n_folds=int(d.get("n_folds", 5)),
                            seed=int(cfg["seed"]))
     ds = VaaniSpanDataset(va, root=args.data, le=le, clip_len=float(d["clip_len"]),
-                          sr=int(d["sr"]), fps=fps, train=False, augment=False)
+                          sr=int(d["sr"]), fps=fps, train=False)
     ld = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                     num_workers=args.num_workers, collate_fn=collate)
 

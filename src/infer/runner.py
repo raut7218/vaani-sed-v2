@@ -25,6 +25,46 @@ DEFAULT_POSTPROC = {
 
 
 @torch.no_grad()
+def _decode_to_host(out: dict, fps: float, pp: dict) -> tuple:
+    """Decode on the GPU and start the device->host copy without waiting on it.
+
+    Returns (tensors, event): the tensors are only safe to read once `event`
+    has completed, which lets the caller queue the next batch's forward first.
+    """
+    n_frames = out["base_mask"].size(1)
+    spans, scores, _, _ = decode_spans(out, n_frames, fps)
+    ts = (spans.float(),
+          (scores.float() * float(pp["score_scale"])).clamp(0, 1),
+          out["count_logits"].float().softmax(-1))
+    if ts[0].device.type != "cuda":
+        return ts, None
+    host = tuple(torch.empty(t.shape, dtype=t.dtype, pin_memory=True) for t in ts)
+    for h, t in zip(host, ts):
+        h.copy_(t, non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record()
+    return host, ev
+
+
+def _host_to_candidates(host: tuple, event, durations: np.ndarray,
+                        pp: dict, shift: float = 0.0) -> List[dict]:
+    if event is not None:
+        event.synchronize()
+    spans, scores, counts = (t.numpy() for t in host)
+    res = []
+    for i in range(spans.shape[0]):
+        dur = float(durations[i])
+        s, c = spans[i], scores[i]
+        ok = (c > 1e-4) & (s[:, 1] > s[:, 0])
+        s, c = s[ok] - shift, c[ok]
+        s = np.clip(s, 0.0, dur)
+        s, c = soft_nms_1d(s, c, sigma=float(pp["nms_sigma"]),
+                           iou_thr=float(pp["nms_iou"]),
+                           max_out=int(pp["max_out"]))
+        res.append({"spans": s, "scores": c, "count": counts[i], "duration": dur})
+    return res
+
+
 def spans_from_output(out: dict, fps: float, durations: np.ndarray,
                       pp: dict | None = None) -> List[dict]:
     """Decode one batch of model outputs into per-clip candidate spans.
@@ -34,25 +74,8 @@ def spans_from_output(out: dict, fps: float, durations: np.ndarray,
     then fusing throws away exactly the agreement that makes fusion work.
     """
     pp = {**DEFAULT_POSTPROC, **(pp or {})}
-    n_frames = out["base_mask"].size(1)
-    spans, scores, cls_ids, _ = decode_spans(out, n_frames, fps)
-    spans = spans.float().cpu().numpy()
-    scores = (scores.float() * float(pp["score_scale"])).clamp(0, 1).cpu().numpy()
-    cls_ids = cls_ids.cpu().numpy()
-    counts = out["count_logits"].softmax(-1).float().cpu().numpy()
-
-    res = []
-    for i in range(spans.shape[0]):
-        dur = float(durations[i])
-        s, c = spans[i], scores[i]
-        ok = (c > 1e-4) & (s[:, 1] > s[:, 0])
-        s, c, k = s[ok], c[ok], cls_ids[i][ok]
-        s = np.clip(s, 0.0, dur)
-        s, c = soft_nms_1d(s, c, sigma=float(pp["nms_sigma"]),
-                           iou_thr=float(pp["nms_iou"]),
-                           max_out=int(pp["max_out"]))
-        res.append({"spans": s, "scores": c, "count": counts[i], "duration": dur})
-    return res
+    host, ev = _decode_to_host(out, fps, pp)
+    return _host_to_candidates(host, ev, durations, pp)
 
 
 def candidates_to_events(cand: dict, pp: dict | None = None) -> List[List[float]]:
@@ -81,40 +104,51 @@ def fuse_candidates(per_model: List[dict], pp: dict | None = None) -> dict:
 @torch.no_grad()
 def run_loader(model, loader, device, fps: float, pp: dict | None = None,
                amp: bool = True, tta: bool = False) -> Dict[str, dict]:
-    """Run the model over a loader and return {uid: candidate dict}."""
+    """Run the model over a loader and return {uid: candidate dict}.
+
+    Software-pipelined: batch i's CPU post-processing (SoftNMS, one clip at a
+    time) runs while batch i+1's forward is already queued on the GPU, instead
+    of the GPU idling through it.
+    """
+    pp = {**DEFAULT_POSTPROC, **(pp or {})}
     model.eval()
     out_all: Dict[str, dict] = {}
+    pending = None
+
+    def finish(p):
+        uids, durations, decoded = p
+        sets = [_host_to_candidates(h, ev, durations, pp, shift)
+                for h, ev, shift in decoded]
+        cands = sets[0] if len(sets) == 1 else \
+            [fuse_candidates(list(c), pp) for c in zip(*sets)]
+        for uid, c in zip(uids, cands):
+            out_all[uid] = c
+
     for batch in loader:
         wav = batch["wav"].to(device, non_blocking=True)
         fv = batch["frame_valid"].to(device, non_blocking=True)
-        durations = fv.sum(1).cpu().numpy() / fps
+        durations = batch["frame_valid"].sum(1).numpy() / fps
         with torch.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
             out = model(wav, fv)
-        cands = spans_from_output(out, fps, durations, pp)
+        decoded = [_decode_to_host(out, fps, pp) + (0.0,)]
 
         if tta:
             # Time-shift TTA. A half-frame shift is the cheapest probe of
             # boundary stability there is, and fusing the two span sets
-            # (never the posteriors) keeps the edges sharp.
+            # (never the posteriors) keeps the edges sharp. `shift /
+            # samples_per_sec` is already seconds; the shifted branch's spans
+            # are moved back by exactly that before fusion.
             samples_per_sec = wav.size(-1) / (fv.size(1) / fps)
             shift = int(0.02 * samples_per_sec)
             wav2 = torch.roll(wav, shifts=shift, dims=-1)
             with torch.autocast(device_type=device.type,
                                 enabled=amp and device.type == "cuda"):
                 out2 = model(wav2, fv)
-            c2 = spans_from_output(out2, fps, durations, pp)
-            # `shift / samples_per_sec` is already seconds. The extra `/ fps` this
-            # used to carry made the correction 25x too small, so the shifted
-            # branch's spans came back still displaced by ~19 ms of the 20 ms
-            # shift - and were then fused with the unshifted ones, smearing every
-            # boundary by roughly half that. TTA is on by default in predict.py,
-            # so this was live on every submission.
-            dt = shift / samples_per_sec
-            for c in c2:
-                if len(c["spans"]):
-                    c["spans"] = c["spans"] - dt
-            cands = [fuse_candidates([a, b], pp) for a, b in zip(cands, c2)]
+            decoded.append(_decode_to_host(out2, fps, pp) + (shift / samples_per_sec,))
 
-        for uid, c in zip(batch["uid"], cands):
-            out_all[uid] = c
+        if pending is not None:
+            finish(pending)
+        pending = (batch["uid"], durations, decoded)
+    if pending is not None:
+        finish(pending)
     return out_all

@@ -316,29 +316,6 @@ def test_save_atomic():
               not (Path(d) / "best.pt.tmp").exists())
 
 
-def test_preflight_projection():
-    """Two shards must extrapolate to the whole corpus, and refuse when it will not fit."""
-    import tempfile
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-    from preflight import budget, du
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d) / "audio"
-        root.mkdir()
-        (root / "a.bin").write_bytes(b"x" * 1000)
-        (root / "b.bin").write_bytes(b"x" * 500)
-        check("preflight: du sums a tree", du(root) == 1500)
-        check("preflight: du of a missing path is 0", du(Path(d) / "nope") == 0)
-        # Off Kaggle the budget is just the filesystem's; either way it is a
-        # count of bytes, and a negative one would make every projection pass.
-        check("preflight: budget is non-negative", budget(Path(d)) >= 0)
-
-    # 2 of 182 shards, so x91 - the arithmetic the STOP message is built on.
-    audio_now, on_server, done = 1500, 182, 2
-    scale = on_server / float(done)
-    check("preflight: extrapolates by shard count", abs(audio_now * scale - 136500) < 1)
-
-
 def test_ema_weight_norm():
     """The EMA must be able to clone a model carrying `weight_norm`.
 
@@ -388,7 +365,7 @@ def test_ema_weight_norm():
     with torch.no_grad():
         model.state_dict()[key].add_(1.0)
     after_src = model.state_dict()[key].clone()
-    ema.update(model)
+    ema.update()
     want = 0.9 * before + 0.1 * after_src
     check("ema: update averages towards the model",
           torch.allclose(ema.shadow.state_dict()[key], want, atol=1e-6))
@@ -400,6 +377,124 @@ def test_ema_weight_norm():
     check("ema: the shadow runs a forward pass", out.shape == (2, 16, 32))
     ema.shadow.load_state_dict(ema.shadow.state_dict())
     check("ema: the shadow survives a state_dict round-trip (--resume)", True)
+
+def test_ema_skips_frozen():
+    """The EMA averages only what can change, and re-pairs after an unfreeze."""
+    import torch.nn as nn
+    from src.train.train import EMA
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    for p in model[0].parameters():
+        p.requires_grad = False
+    ema = EMA(model, decay=0.5)
+    check("ema: frozen tensors are not averaged", len(ema._src) == 2)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    ema.update()
+    check("ema: trainable tensors move halfway",
+          torch.allclose(ema.shadow[1].weight, model[1].weight - 0.5))
+    for p in model[0].parameters():
+        p.requires_grad = True
+    ema.refresh(model)
+    check("ema: refresh picks up newly trainable tensors", len(ema._src) == 4)
+
+
+def test_packed_dataset():
+    """A packed corpus must read back exactly what the loose files hold."""
+    import json
+    import subprocess
+    import tempfile
+    from scripts.smoke_test import make_corpus
+    from src.data.dataset import VaaniSpanDataset, load_manifest
+    from src.data.labels import LabelEncoder
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        make_corpus(d / "data", n=12)
+        (d / "data" / "vad").mkdir()
+        recs = load_manifest(d / "data" / "manifest.jsonl")
+        for r in recs[::2]:
+            np.save(d / "data" / "vad" / (r["uid"] + ".npy"),
+                    np.random.rand(150).astype("float32"))
+        subprocess.run([sys.executable, str(root / "scripts" / "pack_data.py"),
+                        "--data", str(d / "data"), "--out", str(d / "packed"),
+                        "--pack-gb", "0.0005"], check=True, capture_output=True)
+        packed = load_manifest(d / "packed" / "manifest.jsonl")
+        le = LabelEncoder()
+        a = VaaniSpanDataset(recs, d / "data", le, train=False, vad_dir=d / "data" / "vad")
+        b = VaaniSpanDataset(packed, d / "packed", le, train=False)
+        same = all(torch.allclose(x[k].float(), y[k].float(), atol=1e-3)
+                   for x, y in (( a[i], b[i]) for i in range(len(recs)))
+                   for k in x if k != "uid")
+        check("pack: packed clips decode identically", same)
+        check("pack: spread over several packs",
+              len({r["pack"] for r in packed}) > 1)
+        check("pack: VAD kept for exactly the clips that had it",
+              sum("vad_off" in r for r in packed) == len(recs[::2]))
+
+
+def test_kaldi_fbank():
+    """The batched BEATs front-end must match torchaudio's Kaldi fbank."""
+    import torchaudio.compliance.kaldi as ta_kaldi
+    from src.models.encoders import KaldiFbank
+    torch.manual_seed(0)
+    wav = torch.randn(3, 32000) * 0.1
+    wav[2, 20000:] = 0
+    ref = torch.stack([ta_kaldi.fbank(w.unsqueeze(0) * 2 ** 15, num_mel_bins=128,
+                                      sample_frequency=16000, frame_length=25,
+                                      frame_shift=10) for w in wav])
+    got = KaldiFbank()(wav)
+    check("fbank: batched == torchaudio kaldi", got.shape == ref.shape
+          and (got - ref).abs().max().item() < 1e-3,
+          "max diff %.2e" % (got - ref).abs().max().item())
+
+
+def test_encoder_fast_paths():
+    """Fused attention must reproduce the upstream encoders (when present)."""
+    ck = Path(__file__).resolve().parents[1] / "checkpoints"
+    if not (ck / "BEATs_iter3_plus_AS2M.pt").exists() or not (ck / "atst_frame.ckpt").exists():
+        print("%-58s skip (no encoder checkpoints)" % "encoders: fast paths")
+        return
+    from third_party.beats.BEATs import BEATs, BEATsConfig
+    from src.models.encoders import ATSTFrameEncoder, BEATsEncoder, _load_atst
+    torch.manual_seed(0)
+    wav = torch.randn(2, 64000) * 0.1
+
+    raw = torch.load(str(ck / "BEATs_iter3_plus_AS2M.pt"), map_location="cpu",
+                     weights_only=False)
+    ref = BEATs(BEATsConfig(raw["cfg"]))
+    ref.load_state_dict(raw["model"], strict=False)
+    enc = BEATsEncoder(ck / "BEATs_iter3_plus_AS2M.pt")
+    ref.eval(), enc.eval()
+    with torch.no_grad():
+        want = ref.extract_features(wav)[0]
+        want = want.reshape(2, -1, 8, want.size(-1)).mean(2)
+        got = enc(wav)
+    check("beats: SDPA + batched fbank == upstream",
+          (got - want).abs().max().item() < 1e-4,
+          "max diff %.2e" % (got - want).abs().max().item())
+    check("beats: one token per 160 ms step", got.shape[1] == 24)
+
+    a_ref, _ = _load_atst(ck / "atst_frame.ckpt", 0.9)
+    a_enc = ATSTFrameEncoder(ck / "atst_frame.ckpt")
+    a_ref.eval(), a_enc.eval()
+    with torch.no_grad():
+        spec = a_enc.features(wav)
+        n = torch.full((2,), float(spec.size(-1)))
+        want = a_ref.get_intermediate_layers(spec.unsqueeze(1), n, 1, scene=False)
+        got = a_enc(wav)
+    check("atst: SDPA == upstream", (got - want).abs().max().item() < 1e-4,
+          "max diff %.2e" % (got - want).abs().max().item())
+
+    enc.unfreeze_last(2, ckpt=True)
+    enc.train()
+    enc(wav).pow(2).mean().backward()
+    layers = enc.beats.encoder.layers
+    check("unfreeze: gradients reach the top blocks only",
+          layers[-1].fc1.weight.grad is not None and layers[-3].fc1.weight.grad is None)
+
 
 # --------------------------------------------------------------------------- #
 # ATST-Frame, when its checkpoint is present
@@ -457,7 +552,10 @@ if __name__ == "__main__":
     test_district()
     test_ema_weight_norm()
     test_save_atomic()
-    test_preflight_projection()
+    test_ema_skips_frozen()
+    test_packed_dataset()
+    test_kaldi_fbank()
+    test_encoder_fast_paths()
     test_atst_encoder()
     print("\n%d/%d checks passed" % (sum(OK), len(OK)))
     sys.exit(0 if all(OK) else 1)

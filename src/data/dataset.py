@@ -95,16 +95,17 @@ def split_manifest(recs: List[dict], fold: int = 0, n_folds: int = 5,
 class VaaniSpanDataset(Dataset):
     def __init__(self, records: Sequence[dict], root: str | Path, le: LabelEncoder,
                  clip_len: float = 8.0, sr: int = 16000, fps: float = 25.0,
-                 train: bool = True, augment: bool = True,
-                 vad_dir: str | Path | None = None, labels_only: bool = False):
+                 train: bool = True, vad_dir: str | Path | None = None,
+                 labels_only: bool = False):
         self.recs = list(records)
         self.root = Path(root)
         self.le = le
         self.clip_len = float(clip_len)
         self.sr = int(sr)
         self.fps = float(fps)
+        # `train` only randomises the crop. Gain/noise augmentation happens on the
+        # GPU in the training loop (`train.gpu_augment`), off the host CPUs.
         self.train = train
-        self.augment = augment and train
         self.n_samples = int(round(self.clip_len * self.sr))
         self.n_frames = int(round(self.clip_len * self.fps))
         self.vad_dir = Path(vad_dir) if vad_dir else None
@@ -195,11 +196,6 @@ class VaaniSpanDataset(Dataset):
         if len(y) < self.n_samples:
             y = np.pad(y, (0, self.n_samples - len(y)))
         t_off = offset / self.sr
-
-        if self.augment:
-            y = y * float(np.random.uniform(0.85, 1.15))
-            if random.random() < 0.5:
-                y = y + np.random.randn(len(y)).astype("float32") * 1e-3
 
         C, F = len(self.le), self.n_frames
         frame_t = np.zeros((F, C), dtype="float32")
