@@ -42,7 +42,8 @@ model:
   max_count: 8
 
 train:
-  epochs: 60                  # v1 stopped at 30 with val still rising
+  epochs: 50                  # 12 frozen + 38 unfrozen: ~11 h on 2x T4 at batch
+                              # 48/GPU, inside one 12 h Kaggle session
   batch_size: 16              # per GPU under torchrun
   lr: 0.0005
   encoder_lr_scale: 0.05      # pretrained encoders train at 5% of the head LR
@@ -59,8 +60,8 @@ train:
   log_every: 100                  # steps between progress lines (it/s, data-wait, memory)
   # Validation runs on every GPU (each scores its shard) on the EMA weights.
   # Early epochs only monitor; the checkpoint that wins comes from the end.
-  eval_every: 4               # evaluate every N epochs ...
-  eval_last: 8                # ... and every epoch for the final N
+  eval_every: 5               # evaluate every N epochs (and always the last) ...
+  eval_last: 0                # ... plus every epoch for the final N
   eval_raw: false             # also score the raw (non-EMA) weights: 2x eval cost
   eval_batch_size: 0          # 0 = 2 x batch_size (no activations kept for backward)
   unfreeze_epoch: 12          # freeze -> low-LR unfreeze (the ATST-SED schedule)

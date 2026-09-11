@@ -156,18 +156,40 @@ less accurately.
 
 ## Throughput on 2×T4
 
-What a training step and a validation pass cost, and why:
+Measured on Kaggle, batch 48 per GPU, the real packed corpus (607 steps per epoch per
+GPU):
 
 | | Before | Now |
 |---|---|---|
-| Attention in both encoders | explicit `softmax(q·kᵀ)`; BEATs promotes every (B,12,392,392) score tensor to fp32 | fused `scaled_dot_product_attention` (memory-efficient kernel), same maths, tested equal to 1e-6 |
-| BEATs input | per-clip Kaldi fbank in a Python loop | one batched fbank, tested equal to torchaudio |
-| Unfrozen phase | whole encoder under activation checkpointing, then grad accumulation — the frozen 8 blocks were recomputed every step | frozen blocks build no graph; only the top blocks keep activations (`checkpoint_unfrozen` if memory is short) |
-| Validation | rank 0 alone, twice (EMA + raw) over the whole held-out set, every epoch, GPU idle during post-processing | both GPUs, EMA only, CPU post-processing pipelined behind the next batch, `eval_every: 2` + every epoch for the last `eval_last: 10` |
-| EMA | every tensor incl. ~170M frozen encoder parameters, every step | trainable tensors + buffers only |
-| Augmentation | gain + 128k-sample Gaussian noise per clip on 4 shared vCPUs | on the GPU |
-| Checkpoints | `best.pt` + `last.pt` + `state.pt` written synchronously | `best.pt` + `state.pt` from a background thread |
-| Data | re-downloaded, re-VAD'd, re-synthesised every session (~1 h) | packed once, attached as an input |
+| Frozen epoch | ~12.5 min | **~9 min** |
+| Unfrozen epoch | ~32 min | **~13.7 min** |
+| One validation pass (14.5k clips) | ~10 min, every epoch | **~1.8 min**, every 5th epoch |
+| Setup per session (download, VAD, synthesis) | ~1 h | **0** (packed once, attached) |
+| 50 epochs end to end | ~30 h | **~11 h**, inside one 12 h session |
+
+Where it came from, in order of size:
+
+* **BEATs' shared position embedding.** BEATs ties one relative-position embedding
+  across all 12 layers. Unfreezing the top blocks made it trainable, so every frozen
+  layer's attention depended on a trainable tensor and backward ran through the whole
+  stack. It stays frozen now; the frozen stack builds no autograd graph at all.
+* **No whole-encoder activation checkpoint.** The frozen blocks were being recomputed
+  every step for nothing; the top blocks now keep their activations (10–12 GB/GPU).
+* **Validation on both GPUs, EMA weights only, every 5th epoch**, with CPU
+  post-processing pipelined behind the next batch. It used to run twice (EMA + raw)
+  over the whole held-out set on rank 0 every epoch while rank 1 waited.
+* **BEATs' positional conv** (k=128, 16 groups) ran on cuDNN's direct grouped kernel —
+  a quarter of a whole step. It is an FFT correlation now.
+* **Fused attention** (`scaled_dot_product_attention`) in both encoders; BEATs' bias
+  built in fp16; BEATs' GELU in fp16 instead of an fp32 round trip; batched Kaldi
+  fbank instead of a per-clip loop; channels-last mel CNN.
+* EMA over trainable tensors only, gain/noise augmentation on the GPU, fp16 gradient
+  all-reduce, checkpoints written from a background thread, frozen layers in eval mode.
+
+Every numerical change is tested against upstream (`tests/test_components.py`):
+encoder outputs to ~1e-6, gradients to ~1e-7. `--time-limit-h` stops training after
+the last epoch that fits and leaves `state.pt` for `--resume auto`, because a Kaggle
+commit that hits the 12 h wall keeps no output.
 
 Two fixes rode along. BEATs' LayerDrop (0.05 in the checkpoint's config) is off: it
 draws per rank, so once the top blocks train it skips a *different* trainable layer on
