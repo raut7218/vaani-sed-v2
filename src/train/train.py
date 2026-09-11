@@ -471,20 +471,31 @@ def main() -> None:
             logs = {}
             for chunk in chunks:
                 w = chunk["wav"].size(0) / batch["wav"].size(0)
+                # backward() stays *inside* the autocast context on purpose.
+                # torch.utils.checkpoint reruns the checkpointed encoder forward
+                # during backward to get activations it didn't keep; that rerun
+                # needs the same autocast state as the original forward or it
+                # takes a different internal cast path and saves a different
+                # number of tensors than the original pass did - torch then
+                # refuses to backward at all (CheckpointError, seen here as 417
+                # vs 351 tensors: autocast on vs off across ~2 dozen transformer
+                # layers). backward() itself doesn't need autocast; it only ends
+                # up inside this block so the recompute it triggers does.
                 with torch.autocast(device_type=device.type,
                                     enabled=bool(t.get("amp", True)) and device.type == "cuda"):
                     out = model(chunk["wav"], chunk["frame_valid"])
                     c_loss, c_logs = crit(out, chunk)
-                # `c_loss` is already per-example-normalised inside SpanLoss (by
-                # n_pos, frame weight sums, etc.), not summed - so it is already
-                # the same scale as the full batch's loss would be, and only
-                # needs weighting by this chunk's share of the batch, exactly
-                # like standard gradient accumulation.
-                # ponytail: every chunk's backward() triggers a DDP all-reduce,
-                # not just the last one - extra communication, not extra risk.
-                # Wrap the non-final chunks in model.no_sync() if that overhead
-                # ever shows up in the per-epoch timing.
-                scaler.scale(c_loss * w).backward()
+                    # `c_loss` is already per-example-normalised inside SpanLoss
+                    # (by n_pos, frame weight sums, etc.), not summed - so it is
+                    # already the same scale as the full batch's loss would be,
+                    # and only needs weighting by this chunk's share of the
+                    # batch, exactly like standard gradient accumulation.
+                    # ponytail: every chunk's backward() triggers a DDP
+                    # all-reduce, not just the last one - extra communication,
+                    # not extra risk. Wrap the non-final chunks in
+                    # model.no_sync() if that overhead ever shows up in the
+                    # per-epoch timing.
+                    scaler.scale(c_loss * w).backward()
                 for k, v in c_logs.items():
                     logs[k] = logs.get(k, 0.0) + v.detach() * w
             scaler.unscale_(opt)
