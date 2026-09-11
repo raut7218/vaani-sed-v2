@@ -15,8 +15,10 @@ rotate so model selection averages over folds instead.
 """
 from __future__ import annotations
 
+import io
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -115,12 +117,28 @@ class VaaniSpanDataset(Dataset):
     def __len__(self) -> int:
         return len(self.recs)
 
+    def _fd(self, path: Path) -> int:
+        # One descriptor per pack per process, opened lazily so each DataLoader
+        # worker gets its own; `os.pread` never touches the file offset, so
+        # nothing is shared that could race.
+        fds = self.__dict__.setdefault("_fds", {})
+        key = str(path)
+        if key not in fds:
+            fds[key] = os.open(key, os.O_RDONLY)
+        return fds[key]
+
     def _load_wav(self, rec: dict) -> np.ndarray:
         import soundfile as sf
         # `_root` lets a synthetic manifest live in its own directory and still
         # be mixed into one training set.
         root = Path(rec.get("_root", self.root))
-        y, sr = sf.read(str(root / rec["path"]), dtype="float32", always_2d=False)
+        if "pack" in rec:                      # scripts/pack_data.py layout
+            blob = os.pread(self._fd(root / rec["pack"]), int(rec["nbytes"]),
+                            int(rec["off"]))
+            src = io.BytesIO(blob)
+        else:
+            src = str(root / rec["path"])
+        y, sr = sf.read(src, dtype="float32", always_2d=False)
         if y.ndim > 1:
             y = y.mean(axis=1)
         if sr != self.sr:
@@ -128,13 +146,24 @@ class VaaniSpanDataset(Dataset):
             y = librosa.resample(y, orig_sr=sr, target_sr=self.sr)
         return y.astype("float32")
 
-    def _load_vad(self, uid: str, t_off: float) -> tuple:
+    def _vad_array(self, rec: dict):
+        if "vad_off" in rec:                   # packed: one float16 file per root
+            root = Path(rec.get("_root", self.root))
+            mm = self.__dict__.setdefault("_vad_mm", {})
+            if str(root) not in mm:
+                mm[str(root)] = np.memmap(root / "vad.f16", dtype="float16", mode="r")
+            a = int(rec["vad_off"])
+            return mm[str(root)][a:a + int(rec["vad_n"])]
         if self.vad_dir is None:
+            return None
+        p = self.vad_dir / (rec["uid"] + ".npy")
+        return np.load(p) if p.exists() else None
+
+    def _load_vad(self, rec: dict, t_off: float) -> tuple:
+        v = self._vad_array(rec)
+        if v is None:
             return np.zeros((self.n_frames,), "float32"), 0.0
-        p = self.vad_dir / (uid + ".npy")
-        if not p.exists():
-            return np.zeros((self.n_frames,), "float32"), 0.0
-        v = np.load(p).astype("float32")            # speech prob at self.fps
+        v = np.asarray(v, dtype="float32")          # speech prob at self.fps
         a = int(round(t_off * self.fps))
         v = v[a:a + self.n_frames]
         out = np.zeros((self.n_frames,), "float32")
@@ -210,7 +239,7 @@ class VaaniSpanDataset(Dataset):
         n_valid = int(min(F, math.ceil(valid_samples / self.sr * self.fps)))
         frame_valid = np.zeros((F,), dtype="float32")
         frame_valid[:max(1, n_valid)] = 1.0
-        speech, has_vad = self._load_vad(rec["uid"], t_off)
+        speech, has_vad = self._load_vad(rec, t_off)
 
         return {
             "wav": torch.from_numpy(y),
