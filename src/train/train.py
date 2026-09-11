@@ -357,9 +357,20 @@ def main() -> None:
     def wrap_ddp(net):
         if not ddp:
             return net
+        # static_graph=True: DDP's autograd hooks assume forward runs the graph
+        # exactly once per backward. torch.utils.checkpoint's non-reentrant mode
+        # re-enters the checkpointed region during backward to recompute it,
+        # which without static_graph confuses DDP's bookkeeping into thinking a
+        # different number of tensors were saved between the two passes
+        # (CheckpointError, 417 vs 351 tensors - reproducible, identical count
+        # every time, which is what pointed at a structural DDP/checkpoint
+        # mismatch rather than floating-point nondeterminism in the encoder
+        # itself). Harmless when the encoder is still frozen and nothing is
+        # checkpointed: the graph is static there too, just simpler.
         return torch.nn.parallel.DistributedDataParallel(
             _unwrap(net), device_ids=[device.index],
-            find_unused_parameters=bool(t.get("find_unused_parameters", False)))
+            find_unused_parameters=bool(t.get("find_unused_parameters", False)),
+            static_graph=True)
 
     model = wrap_ddp(model)
 
