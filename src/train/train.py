@@ -28,6 +28,9 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 import torch.distributed as dist

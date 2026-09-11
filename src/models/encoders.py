@@ -29,12 +29,14 @@ actually present, and reports what it loaded, so the pipeline always runs.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 from typing import List, Sequence
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as _checkpoint
 
 from src.models.frontend import resample_time
 
@@ -131,7 +133,12 @@ class BEATsEncoder(EncoderBase):
         return min(n_blocks, len(layers))
 
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
-        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        # nullcontext, not enable_grad(): when unfrozen this runs under
+        # torch.utils.checkpoint (see FusionEncoder.forward), whose memory saving
+        # depends on the *first* pass running under the ambient no-grad context
+        # checkpoint sets up. Forcing enable_grad() here would build and keep the
+        # full activation graph on that first pass too, defeating the checkpoint.
+        ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
         with ctx:
             out = self.beats.extract_features(wav)
             feat = out[0] if isinstance(out, (tuple, list)) else out
@@ -211,7 +218,7 @@ class ATSTFrameEncoder(EncoderBase):
         return spec
 
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
-        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
         with ctx:
             spec = self.features(wav)                      # (B, 64, T)
             n_mel = spec.size(-1)
@@ -369,7 +376,7 @@ class WavLMEncoder(EncoderBase):
         return min(n_blocks, len(layers))
 
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
-        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
         with ctx:
             feats, _ = self.model.extract_features(wav, num_layers=self.layer + 1)
         return torch.nan_to_num(feats[-1], nan=0.0, posinf=0.0, neginf=0.0)
@@ -417,7 +424,15 @@ class FusionEncoder(nn.Module):
         for enc, proj in zip(self.encoders, self.projs):
             raw = None if cache is None else cache.get(enc.name)
             if raw is None:
-                raw = enc(wav)
+                if self.training and not getattr(enc, "frozen", True):
+                    # Once unfrozen, this encoder's forward builds a full
+                    # activation graph for backward. Recomputing it in the
+                    # backward pass instead trades ~30% more compute on this
+                    # branch for the activation memory that pushed a T4 over
+                    # its limit the moment `unfreeze_epoch` hit (see git log).
+                    raw = _checkpoint.checkpoint(enc, wav, use_reentrant=False)
+                else:
+                    raw = enc(wav)
             h = proj(raw.to(proj[0].weight.dtype))
             outs.append(resample_time(h, target_len))
         if not outs:
