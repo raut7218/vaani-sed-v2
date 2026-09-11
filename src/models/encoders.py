@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 from typing import List, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as _checkpoint
@@ -382,6 +383,35 @@ class WavLMEncoder(EncoderBase):
         return torch.nan_to_num(feats[-1], nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _pin_numpy_rng(enc: nn.Module):
+    """Wrap `enc` so a torch.utils.checkpoint recompute sees the same NumPy
+    draws as the original forward call.
+
+    `torch.utils.checkpoint`'s `preserve_rng_state` only saves/restores
+    torch's own RNG (CPU + CUDA). BEATs' encoder implements LayerDrop with
+    ``dropout_probability = np.random.random()`` (vendored, unmodified) -
+    NumPy, not torch - so it is invisible to that mechanism. Checkpointed
+    forward runs twice (original, then recompute during backward); each call
+    advances NumPy's global RNG, so the recompute drew a *different* value
+    than the original did and randomly kept/dropped a different set of
+    layers - a different tensor count between the two passes, which is
+    exactly what CheckpointError reports (measured here: 417 vs 351).
+    Capturing NumPy's state before the first call and restoring it before the
+    second makes both calls draw identically, matching what checkpoint
+    already does for torch's RNG.
+    """
+    box: list = []
+
+    def call(wav):
+        if box:
+            np.random.set_state(box.pop())
+        else:
+            box.append(np.random.get_state())
+        return enc(wav)
+
+    return call
+
+
 # --------------------------------------------------------------------------- #
 # Fusion
 # --------------------------------------------------------------------------- #
@@ -430,7 +460,8 @@ class FusionEncoder(nn.Module):
                     # backward pass instead trades ~30% more compute on this
                     # branch for the activation memory that pushed a T4 over
                     # its limit the moment `unfreeze_epoch` hit (see git log).
-                    raw = _checkpoint.checkpoint(enc, wav, use_reentrant=False)
+                    raw = _checkpoint.checkpoint(_pin_numpy_rng(enc), wav,
+                                                 use_reentrant=False)
                 else:
                     raw = enc(wav)
             h = proj(raw.to(proj[0].weight.dtype))
