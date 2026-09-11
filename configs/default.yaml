@@ -37,10 +37,6 @@ model:
   n_head: 8
   n_bins: 16                  # boundary distribution bins per level
   dropout: 0.1
-  n_basis: 1                  # FDY conv basis kernels; 1 = plain conv.
-                              # Raise to 4 for the v1 ablation - it costs 4x the
-                              # conv FLOPs on a branch that was never the
-                              # bottleneck.
   specaug: true
   flux: true                  # spectral-flux onset channels alongside the mel
   max_count: 8
@@ -56,19 +52,23 @@ train:
   ema_decay: 0.999            # EMA of *weights*, not a mean-teacher consistency term
   amp: true
   find_unused_parameters: false   # this graph has none; the traversal is pure cost
-  ddp_timeout_min: 60             # rank 0 evaluates alone while its peers wait
+  ddp_timeout_min: 60
   num_workers: 4                  # per rank; divided by world size at runtime
   prefetch_factor: 4
-  eval_every: 1
+  log_every: 100                  # steps between progress lines (it/s, data-wait, memory)
+  # Validation runs on every GPU (each scores its shard) on the EMA weights.
+  # Early epochs only monitor; the checkpoint that wins comes from the end.
+  eval_every: 2               # evaluate every N epochs ...
+  eval_last: 10               # ... and every epoch for the final N
+  eval_raw: false             # also score the raw (non-EMA) weights: 2x eval cost
+  eval_batch_size: 0          # 0 = 2 x batch_size (no activations kept for backward)
   unfreeze_epoch: 12          # freeze -> low-LR unfreeze (the ATST-SED schedule)
   unfreeze_blocks: 4
-  unfreeze_grad_accum: 2      # split each batch into this many micro-steps once
-                              # unfrozen, gradients accumulated before the one
-                              # optimiser step per batch. Checkpointing the
-                              # encoder forward alone was not enough headroom on
-                              # a 14.6 GB T4 at batch_size 48 - measured OOM
-                              # during checkpoint's own backward recompute, short
-                              # by ~30-40 MiB. Raise if still OOMing; 1 disables it.
+  checkpoint_unfrozen: false  # recompute the trainable blocks' activations in
+                              # backward (never the frozen stack) - only if the
+                              # unfrozen phase runs out of memory
+  unfreeze_grad_accum: 1      # micro-batches per step once unfrozen, the last
+                              # resort for memory after checkpoint_unfrozen
   tier_quotas:
     gold: 0.5                 # gold up-weighted vs v1: it is the only tier whose
     silver: 0.35              # boundaries can supervise the regression head
