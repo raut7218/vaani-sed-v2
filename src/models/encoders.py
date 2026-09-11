@@ -70,8 +70,14 @@ class EncoderBase(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.frozen:
-            self.backbone().eval()
+        # Frozen weights are a fixed feature extractor: the frozen part of the
+        # backbone stays in eval mode (no dropout, no attention-dropout RNG over
+        # every (B, H, L, L) score tensor), and only trainable blocks train.
+        self.backbone().eval()
+        if mode and not self.frozen:
+            for blk in self.blocks():
+                if any(p.requires_grad for p in blk.parameters()):
+                    blk.train()
         return self
 
     def backbone(self) -> nn.Module:
@@ -312,6 +318,12 @@ class BEATsEncoder(EncoderBase):
                 m.forward = _beats_sdpa.__get__(m)
         conv = model.encoder.pos_conv[0]
         conv.forward = _fft_group_conv1d.__get__(conv)
+        # Upstream's GELU is `gelu(x.float()).type_as(x)`: two full copies of
+        # every (L, B, 3072) FFN activation per layer. The fp16 GELU kernel
+        # already evaluates in fp32 internally.
+        for layer in model.encoder.layers:
+            if layer.activation_name == "gelu":
+                layer.activation_fn = F.gelu
         self.beats = model
         self.fbank = KaldiFbank()
         self.out_dim = cfg.encoder_embed_dim

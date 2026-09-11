@@ -52,14 +52,15 @@ train:
   ema_decay: 0.999            # EMA of *weights*, not a mean-teacher consistency term
   amp: true
   find_unused_parameters: false   # this graph has none; the traversal is pure cost
+  fp16_allreduce: true            # compress DDP gradients to fp16 over PCIe
   ddp_timeout_min: 60
   num_workers: 4                  # per rank; divided by world size at runtime
   prefetch_factor: 4
   log_every: 100                  # steps between progress lines (it/s, data-wait, memory)
   # Validation runs on every GPU (each scores its shard) on the EMA weights.
   # Early epochs only monitor; the checkpoint that wins comes from the end.
-  eval_every: 2               # evaluate every N epochs ...
-  eval_last: 10               # ... and every epoch for the final N
+  eval_every: 4               # evaluate every N epochs ...
+  eval_last: 8                # ... and every epoch for the final N
   eval_raw: false             # also score the raw (non-EMA) weights: 2x eval cost
   eval_batch_size: 0          # 0 = 2 x batch_size (no activations kept for backward)
   unfreeze_epoch: 12          # freeze -> low-LR unfreeze (the ATST-SED schedule)

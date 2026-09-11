@@ -319,6 +319,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=0, help="per GPU")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vad-dir", default="")
+    ap.add_argument("--time-limit-h", type=float, default=0.0,
+                    help="stop after the last epoch that fits in this many hours "
+                         "(state.pt is written; resume in the next session)")
     ap.add_argument("--max-steps", type=int, default=0,
                     help="stop each epoch after this many steps (profiling only)")
     ap.add_argument("--resume", default="",
@@ -399,10 +402,17 @@ def main() -> None:
     def wrap_ddp(net):
         if not ddp:
             return net
-        return torch.nn.parallel.DistributedDataParallel(
+        ddp_net = torch.nn.parallel.DistributedDataParallel(
             _unwrap(net), device_ids=[device.index],
             find_unused_parameters=bool(t.get("find_unused_parameters", False)),
             gradient_as_bucket_view=True)
+        if bool(t.get("fp16_allreduce", True)):
+            # Two T4s talk over PCIe; halving the bytes of every gradient
+            # all-reduce is most of DDP's cost once the encoder blocks train.
+            # An overflow shows up as inf, which the GradScaler already skips.
+            from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+            ddp_net.register_comm_hook(None, default_hooks.fp16_compress_hook)
+        return ddp_net
 
     crit = SpanLoss(cfg, len(le), int(m.get("n_bins", 16)))
     lr = float(t["lr"])
@@ -481,7 +491,19 @@ def main() -> None:
     log("[train] %d steps/epoch/rank x %d rank(s), batch %d/GPU, %.1fM trainable params"
         % (len(sampler), world, bs, n_params / 1e6))
 
+    t_start, recent = time.time(), []
     for epoch in range(start_epoch, epochs + 1):
+        if args.time_limit_h and epoch > start_epoch:
+            # Kaggle kills a session at its limit and a killed commit keeps no
+            # output, so stop while the next epoch would still not fit.
+            left = args.time_limit_h * 3600 - (time.time() - t_start)
+            epoch_s = max(recent[-3:])          # eval epochs run longer
+            if left < 1.1 * epoch_s:
+                log("[time] %.0f min left, an epoch takes %.0f min - stopping at "
+                    "epoch %d; --resume auto continues from here"
+                    % (left / 60, epoch_s / 60, epoch - 1))
+                break
+        t_epoch = time.time()
         is_unfrozen = epoch > unfreeze_at and n_unfreeze > 0
         if epoch == unfreeze_at + 1 and n_unfreeze > 0:
             got = unfreeze()
@@ -596,6 +618,13 @@ def main() -> None:
         # only work here that its peer does not share.
         if ddp:
             dist.barrier()
+        # Every rank must agree on when to stop, so the epoch time is rank 0's.
+        epoch_s = time.time() - t_epoch
+        if ddp:
+            tt = torch.tensor([epoch_s], device=device)
+            dist.broadcast(tt, 0)
+            epoch_s = float(tt.item())
+        recent.append(epoch_s)
 
     if is_main():
         saver.wait()

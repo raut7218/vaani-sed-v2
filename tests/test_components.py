@@ -493,6 +493,9 @@ def test_encoder_fast_paths():
     layers = enc.beats.encoder.layers
     check("unfreeze: gradients reach the top blocks only",
           layers[-1].fc1.weight.grad is not None and layers[-3].fc1.weight.grad is None)
+    check("unfreeze: frozen blocks stay in eval mode, trainable ones train",
+          not layers[0].training and layers[-1].training
+          and not enc.beats.encoder.training)
     rel = layers[0].self_attn.relative_attention_bias.weight
     check("unfreeze: BEATs' shared position embedding stays frozen",
           not rel.requires_grad and rel.grad is None)
