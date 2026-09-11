@@ -105,7 +105,7 @@ class VaaniSpanModel(nn.Module):
         self.logmel = LogMel(sr=sr, hop=hop, n_mels=n_mels)
         self.specaug = SpecAugment() if use_specaug else nn.Identity()
         self.cnn = MelCNN(in_ch=3 if use_flux else 1, n_mels=n_mels,
-                          dropout=dropout * 0.5)
+                          dropout=dropout * 0.5).to(memory_format=torch.channels_last)
         self.encoder = encoder
         d_in = self.cnn.out_dim + (encoder.out_dim if encoder is not None else 0)
 
@@ -127,7 +127,10 @@ class VaaniSpanModel(nn.Module):
         if self.use_flux:
             mel = torch.cat([mel, onset_strength(mel)], dim=1)
         mel = self.specaug(mel)
-        h = self.cnn(mel)                                      # (B, T', D)
+        # NHWC: cuDNN's fp16 tensor-core convs want it, and with NCHW every
+        # conv in the CNN pays a layout conversion each way.
+        h = self.cnn(mel.contiguous(memory_format=torch.channels_last))
+
         h = resample_time(h, self.n_frames)
 
         if self.encoder is not None and len(self.encoder.encoders) > 0:

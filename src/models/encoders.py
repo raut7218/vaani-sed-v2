@@ -100,7 +100,34 @@ class EncoderBase(nn.Module):
             if ckpt:
                 blk.forward = _checkpointed_forward.__get__(blk)
         self.frozen = False
+        if next(self.parameters()).is_cuda and not self._fused_backward_ok(top[-1]):
+            # The fused kernel's backward refuses some (head, length) layouts on
+            # sm75 ("LSE is not correctly aligned"). Frozen blocks never run a
+            # backward, so only the trainable ones switch to explicit attention.
+            _log("[%s] fused attention backward unavailable here - trainable "
+                 "blocks use explicit attention" % self.name)
+            for blk in top:
+                for m in blk.modules():
+                    m._explicit_grad = True
         return len(top)
+
+    def _probe_input(self, device) -> tuple:
+        raise NotImplementedError
+
+    def _fused_backward_ok(self, blk: nn.Module) -> bool:
+        """Run one tiny forward+backward through `blk` on the real layout."""
+        args, kwargs = self._probe_input(next(blk.parameters()).device)
+        try:
+            with torch.autocast(device_type="cuda"):
+                out = blk(*args, **kwargs)
+            (out[0] if isinstance(out, tuple) else out).float().sum().backward()
+            ok = True
+        except RuntimeError as e:
+            _log("[%s] fused backward probe: %s" % (self.name, str(e).splitlines()[0]))
+            ok = False
+        for p in blk.parameters():
+            p.grad = None
+        return ok
 
     def _grad_ctx(self):
         return torch.no_grad() if self.frozen else contextlib.nullcontext()
@@ -175,6 +202,34 @@ class KaldiFbank(nn.Module):
             return mel.clamp(min=eps).log()                         # (B, T, 128)
 
 
+def _fft_group_conv1d(self, x: torch.Tensor) -> torch.Tensor:
+    """BEATs' positional conv (k=128, 16 groups) as an FFT correlation.
+
+    cuDNN has no good kernel for a grouped 1D conv this wide and falls back to a
+    direct one: ~0.37 s per 48-clip batch on a T4, a quarter of a whole training
+    step, for ~85 GFLOP of work. In the frequency domain it is one rfft, a
+    batched (clips x 48) @ (48 x 48) complex matmul per group and bin, and one
+    irfft. Run in fp32; `weight_norm`'s pre-hook has already set `self.weight`.
+    """
+    dtype = x.dtype
+    w = self.weight
+    g, (p,), K = self.groups, self.padding, w.size(-1)
+    B, C, T = x.shape
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        L = T + 2 * p
+        n = -(-L // 64) * 64
+        X = torch.fft.rfft(F.pad(x.float(), (p, p)), n=n)       # (B, C, n/2+1)
+        W = torch.fft.rfft(w.float(), n=n)                       # (Co, Ci, n/2+1)
+        ci, co = C // g, w.size(0) // g
+        X = X.view(B, g, ci, -1).permute(1, 3, 0, 2)             # (g, F, B, ci)
+        W = W.conj().view(g, co, ci, -1).permute(0, 3, 2, 1)     # (g, F, ci, co)
+        Y = torch.matmul(X, W).permute(2, 0, 3, 1).reshape(B, g * co, -1)
+        y = torch.fft.irfft(Y, n=n)[..., :L - K + 1]
+        if self.bias is not None:
+            y = y + self.bias.float()[:, None]
+    return y.to(dtype)
+
+
 def _beats_sdpa(self, query, key, value, key_padding_mask=None,
                 incremental_state=None, need_weights=False, static_kv=False,
                 attn_mask=None, before_softmax=False, need_head_weights=False,
@@ -202,7 +257,11 @@ def _beats_sdpa(self, query, key, value, key_padding_mask=None,
         if self.gru_rel_pos == 1:
             g = self.grep_linear(q).view(B, H, L, 2, 4).sum(-1)
             gate_a, gate_b = torch.sigmoid(g).chunk(2, dim=-1)
-            bias = (gate_a * (gate_b * self.grep_a - 1.0) + 2.0) * position_bias
+            gate = gate_a * (gate_b * self.grep_a - 1.0) + 2.0          # (B, H, L, 1)
+            # Built straight in the attention dtype: an fp32 (B, H, L, L)
+            # intermediate is 350 MB per layer at B=48, written and read back
+            # only to be cast down.
+            bias = gate.to(q.dtype) * position_bias.to(q.dtype)
     if key_padding_mask is not None:
         pad = key_padding_mask.view(B, 1, 1, L).to(torch.bool)
         bias = (bias if bias is not None else q.new_zeros((B, 1, L, L)))
@@ -211,8 +270,17 @@ def _beats_sdpa(self, query, key, value, key_padding_mask=None,
         bias = bias.to(q.dtype).expand(B, H, L, L)
 
     p = self.dropout_module.p if self.training else 0.0
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias, dropout_p=p,
-                                         scale=self.scaling)
+    if getattr(self, "_explicit_grad", False) and torch.is_grad_enabled():
+        # Upstream's arithmetic: q pre-scaled by scaling/32 so fp16 q.k stays
+        # small, then the softmax in fp32.
+        att = torch.matmul(q * (self.scaling / 32.0), k.transpose(-1, -2)).float() * 32.0
+        if bias is not None:
+            att = att + bias.float()
+        att = F.dropout(att.softmax(-1).to(v.dtype), p=p, training=self.training)
+        out = torch.matmul(att, v)
+    else:
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias, dropout_p=p,
+                                             scale=self.scaling)
     out = out.permute(2, 0, 1, 3).reshape(L, B, E)
     return self.out_proj(out), None, position_bias
 
@@ -242,6 +310,8 @@ class BEATsEncoder(EncoderBase):
         for m in model.modules():
             if isinstance(m, _bb.MultiheadAttention):
                 m.forward = _beats_sdpa.__get__(m)
+        conv = model.encoder.pos_conv[0]
+        conv.forward = _fft_group_conv1d.__get__(conv)
         self.beats = model
         self.fbank = KaldiFbank()
         self.out_dim = cfg.encoder_embed_dim
@@ -256,6 +326,24 @@ class BEATsEncoder(EncoderBase):
 
     def blocks(self) -> nn.ModuleList:
         return self.beats.encoder.layers
+
+    def unfreeze_last(self, n_blocks: int, ckpt: bool = False) -> int:
+        # The relative-position embedding is one Parameter shared by all 12
+        # layers (upstream ties it to layer 0's). Unfreezing any block would make
+        # it trainable, every frozen layer's attention bias would then depend on
+        # it, and backward would run through the whole stack - roughly 3x the
+        # memory and compute the "top blocks only" schedule is meant to cost.
+        # It stays at its pretrained values.
+        rel = self.beats.encoder.layers[0].self_attn.relative_attention_bias
+        n = EncoderBase.unfreeze_last(self, n_blocks, ckpt)
+        if rel is not None:
+            rel.weight.requires_grad = False
+        return n
+
+    def _probe_input(self, device) -> tuple:
+        L = 49 * self.n_freq                      # an 8 s clip's token count
+        x = torch.randn(L, 2, self.out_dim, device=device, requires_grad=True)
+        return (x,), dict(self_attn_padding_mask=None, need_weights=False, pos_bias=None)
 
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         b = self.beats
@@ -290,6 +378,8 @@ ATST_DB_MIN, ATST_DB_MAX = -79.6482, 50.6842
 
 def _atst_sdpa(self, x, mask):
     """Upstream `Attention.forward` through the fused kernel (mask is None)."""
+    if getattr(self, "_explicit_grad", False) and torch.is_grad_enabled():
+        return type(self).forward(self, x, mask)          # upstream, explicit
     B, N, C = x.shape
     qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
     q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
@@ -332,6 +422,10 @@ class ATSTFrameEncoder(EncoderBase):
 
     def blocks(self) -> nn.ModuleList:
         return self.atst.blocks
+
+    def _probe_input(self, device) -> tuple:
+        x = torch.randn(2, 200, self.out_dim, device=device, requires_grad=True)
+        return (x,), {}
 
     def features(self, wav: torch.Tensor) -> torch.Tensor:
         """(B, L) waveform -> (B, 64, T) normalised mel, exactly as upstream."""
