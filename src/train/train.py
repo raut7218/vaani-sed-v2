@@ -185,6 +185,31 @@ def build_refs(loader, fps: float) -> dict:
     return refs
 
 
+def split_batch(batch: dict, n: int) -> list:
+    """Split a collated batch dict into `n` near-equal chunks along dim 0.
+
+    Used only for gradient accumulation once the encoders unfreeze: forwarding
+    the full configured batch through an unfrozen BEATs/ATST still OOMs a T4
+    even under activation checkpointing (checkpointing frees *forward*
+    activations, but backward's recompute pass briefly needs them again
+    alongside whatever the rest of backward has already allocated - measured
+    on this hardware, that recompute peak is what actually OOMs). Chunking
+    caps the batch any single forward/backward ever holds, without touching
+    `step` or the cosine schedule: still exactly one optimiser step per batch.
+    """
+    bsz = batch["wav"].size(0)
+    n = max(1, min(n, bsz))
+    idx = torch.linspace(0, bsz, n + 1).round().long().tolist()
+    chunks = []
+    for i in range(n):
+        lo, hi = idx[i], idx[i + 1]
+        if hi <= lo:
+            continue
+        chunks.append({k: (v[lo:hi] if torch.is_tensor(v) else v[lo:hi])
+                       for k, v in batch.items()})
+    return chunks
+
+
 def make_param_groups(model, lr: float, enc_scale: float, wd: float):
     """Param groups, each carrying its own `base_lr` for the schedule to scale.
 
@@ -411,8 +436,10 @@ def main() -> None:
     refs = build_refs(ref_ld, float(d["fps"])) if is_main() else {}
 
     clip_params = [p for g in opt.param_groups for p in g["params"]]
+    unfreeze_accum = max(1, int(t.get("unfreeze_grad_accum", 2)))
 
     for epoch in range(start_epoch, epochs + 1):
+        is_unfrozen = epoch > unfreeze_at and int(t.get("unfreeze_blocks", 0)) > 0
         if epoch == unfreeze_at + 1 and int(t.get("unfreeze_blocks", 0)) > 0:
             got = _unwrap(model).encoder.unfreeze_last(int(t["unfreeze_blocks"]))
             log("[train] unfroze top blocks per encoder: %s" % got)
@@ -439,13 +466,27 @@ def main() -> None:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * f
 
-            with torch.autocast(device_type=device.type,
-                                enabled=bool(t.get("amp", True)) and device.type == "cuda"):
-                out = model(batch["wav"], batch["frame_valid"])
-                loss, logs = crit(out, batch)
-
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            chunks = split_batch(batch, unfreeze_accum) if is_unfrozen else [batch]
+            logs = {}
+            for chunk in chunks:
+                w = chunk["wav"].size(0) / batch["wav"].size(0)
+                with torch.autocast(device_type=device.type,
+                                    enabled=bool(t.get("amp", True)) and device.type == "cuda"):
+                    out = model(chunk["wav"], chunk["frame_valid"])
+                    c_loss, c_logs = crit(out, chunk)
+                # `c_loss` is already per-example-normalised inside SpanLoss (by
+                # n_pos, frame weight sums, etc.), not summed - so it is already
+                # the same scale as the full batch's loss would be, and only
+                # needs weighting by this chunk's share of the batch, exactly
+                # like standard gradient accumulation.
+                # ponytail: every chunk's backward() triggers a DDP all-reduce,
+                # not just the last one - extra communication, not extra risk.
+                # Wrap the non-final chunks in model.no_sync() if that overhead
+                # ever shows up in the per-epoch timing.
+                scaler.scale(c_loss * w).backward()
+                for k, v in c_logs.items():
+                    logs[k] = logs.get(k, 0.0) + v.detach() * w
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(clip_params, float(t.get("grad_clip", 5.0)))
             scaler.step(opt)
