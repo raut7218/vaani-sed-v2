@@ -51,12 +51,20 @@ model:
 
 train:
   # Measured, from the 50-epoch fold-0 run: best val 1.1881 at epoch 15, then a
-  # monotone slide to 1.0646 at epoch 50. Seven of that session's eleven hours
-  # were spent making the model worse. The unfreeze at epoch 12 bought +0.0025
-  # and started the slide, so it now happens late and at half the encoder LR,
-  # with the frozen phase - which was still improving when it ended - given the
-  # room instead.
-  epochs: 40
+  # monotone slide to 1.0646 at epoch 50.
+  #
+  # I first read that slide as the epoch-12 encoder unfreeze and moved it late.
+  # The 24-epoch run that followed kept the encoders frozen throughout and slid
+  # anyway - 1.1531 at epoch 12 down to 1.1416 at epoch 24 - so the unfreeze was
+  # not the cause. The cause is that the gold pool is only ~8900 clips and sets
+  # the epoch length, so every epoch is a full pass over it; 18.5M trainable
+  # parameters start memorising it around epoch 12 whatever the encoders do.
+  #
+  # This costs compute, not score: `best.pt` keeps the peak and `eval_every: 2`
+  # is frequent enough to catch it. So the schedule is short by design, and the
+  # budget a longer run would have burned goes to more folds instead - the
+  # ensemble is worth more than the epochs would have been.
+  epochs: 20
   batch_size: 16              # per GPU under torchrun
   lr: 0.0005
   encoder_lr_scale: 0.02      # 0.05 was enough to start the overfit slide
@@ -77,7 +85,10 @@ train:
   eval_last: 0                # ... plus every epoch for the final N
   eval_raw: false             # also score the raw (non-EMA) weights: 2x eval cost
   eval_batch_size: 0          # 0 = 2 x batch_size (no activations kept for backward)
-  unfreeze_epoch: 30          # freeze -> low-LR unfreeze (the ATST-SED schedule)
+  unfreeze_epoch: 999         # off until it is measured against a frozen run of
+                              # the same length. It bought +0.0025 in the only
+                              # run that used it, and the slide it appeared to
+                              # cause happens without it.
   unfreeze_blocks: 4
   checkpoint_unfrozen: false  # recompute the trainable blocks' activations in
                               # backward (never the frozen stack) - only if the
