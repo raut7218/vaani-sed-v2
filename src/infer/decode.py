@@ -32,6 +32,11 @@ def soft_nms_1d(spans: np.ndarray, scores: np.ndarray, sigma: float = 0.5,
     throws that agreement away. Decaying instead lets a genuinely distinct second
     event survive next to a strong one - which matters when 17% of clips hold
     more than one event and some of those overlap.
+
+    Note that `iou_thr` does nothing in the default gaussian mode - the decay is
+    a smooth function of IoU with no threshold in it, and only `mode="linear"`
+    reads it. Sweeping it on the v2 checkpoint gave four identical scores across
+    0.20/0.35/0.50/0.65, which is the sweep noticing it is tuning a dead knob.
     """
     if len(spans) == 0:
         return np.zeros((0, 2), "float32"), np.zeros((0,), "float32")
