@@ -19,7 +19,8 @@ from src.infer.decode import (boundary_agreement, finalise,          # noqa: E40
                               merge_close, refine_boundaries,
                               select_by_count, soft_nms_1d, wbf_1d)
 from src.models.trident import decode_spans                            # noqa: E402
-from src.train.losses import boundary_targets                          # noqa: E402
+from src.train.losses import (boundary_targets,                        # noqa: E402
+                              quality_focal)
 from src.postproc.calibrate import district_of                         # noqa: E402
 from src.train.losses import (assign_targets, diou_1d,                 # noqa: E402
                               distribution_focal, soft_dice)
@@ -140,7 +141,7 @@ def test_assign():
 
     spans = torch.full((2, 3, 2), -1.0)
     spans[0, 0] = torch.tensor([10.0, 14.0])       # 4 frames -> level 0
-    spans[0, 1] = torch.tensor([30.0, 60.0])       # 30 frames -> level 2
+    spans[0, 1] = torch.tensor([30.0, 60.0])       # 30 frames
     spans[1, 0] = torch.tensor([5.0, 5.4])         # 0.4 frames -> shorter than a stride
     cls = torch.full((2, 3), -1, dtype=torch.long)
     cls[0, 0] = 1
@@ -150,7 +151,12 @@ def test_assign():
 
     t = assign_targets(spans, cls, tier, masks, T, n_class, n_bins)
     check("assign: 4-frame event lands on level 0", t["pos"][0][0].sum() > 0)
-    check("assign: 30-frame event lands on level 2", t["pos"][2][0].sum() > 0)
+    # Which level a 30-frame event lands on is a function of the bin geometry,
+    # not a constant: it goes to the finest level whose bins still reach its
+    # boundaries. What must hold is that it lands on exactly one.
+    hit = [lvl for lvl in range(n_levels) if float(t["pos"][lvl][0].sum()) > 0]
+    check("assign: a 30-frame event lands on exactly one level besides level 0",
+          len([l for l in hit if l > 0]) == 1, "levels %s" % hit)
     check("assign: sub-stride event still gets a positive",
           t["pos"][0][1].sum() > 0, "n=%d" % int(t["pos"][0][1].sum()))
     check("assign: agnostic channel is always set at positives",
@@ -175,6 +181,57 @@ def test_assign():
     check("assign: d_start/d_end reconstruct the span",
           abs((idx - ds) - 10.0) < 1e-4 and abs((idx + de) - 14.0) < 1e-4,
           "%.3f %.3f" % (idx - ds, idx + de))
+
+
+def test_quality_focal():
+    """A soft IoU target must rank a well-localised span above a poor one."""
+    logits = torch.tensor([[0.0]])
+    # target 0.9, prediction 0.5: pulled up. target 0.1, same prediction: down.
+    hi = quality_focal(logits, torch.tensor([[0.9]]), torch.ones(1, 1))
+    lo = quality_focal(logits, torch.tensor([[0.1]]), torch.ones(1, 1))
+    check("qfl: a high-IoU target costs the same as a low one at p=0.5",
+          abs(float(hi) - float(lo)) < 0.2, "%.3f vs %.3f" % (hi, lo))
+    # loss vanishes where the prediction already equals the target
+    exact = quality_focal(torch.tensor([[2.1972246]]), torch.tensor([[0.9]]),
+                          torch.ones(1, 1))
+    check("qfl: matching the soft target costs ~nothing", float(exact) < 1e-3,
+          "%.5f" % float(exact))
+    # and a hard target still behaves like a classification loss
+    wrong = quality_focal(torch.tensor([[-4.0]]), torch.tensor([[1.0]]),
+                          torch.ones(1, 1))
+    check("qfl: a confident miss is expensive", float(wrong) > 3.0, "%.2f" % float(wrong))
+    check("qfl: the mask zeroes excluded points",
+          float(quality_focal(logits, torch.tensor([[0.9]]), torch.zeros(1, 1))) == 0.0)
+
+
+def test_level_ranges():
+    """Every event should sit where the metric's tolerance is worth >1 bin."""
+    from src.train.losses import LEGACY_LEVEL_RANGES, level_ranges
+    r = level_ranges(16, 5)
+    check("levels: ranges are contiguous and increasing",
+          all(abs(r[i][1] - r[i + 1][0]) < 1e-6 for i in range(len(r) - 1))
+          and r[0][0] == 0.0)
+
+    def tol_bins(D, ranges):
+        L, tol = D * 25.0, max(0.2 * D, 0.05)
+        lvl = next(i for i, (a, b) in enumerate(ranges) if a <= L < b)
+        return tol * 25.0 / (2 ** lvl)
+
+    # The old table pinned every event above half a second at 1.25 bins of
+    # tolerance, whatever its scale - that is the thing being fixed.
+    old = [tol_bins(D, LEGACY_LEVEL_RANGES) for D in (0.5, 1.0, 2.0, 4.0)]
+    new = [tol_bins(D, r) for D in (0.5, 1.0, 2.0, 4.0)]
+    check("levels: the old table gave 1.25 bins of tolerance at every scale",
+          all(abs(v - 1.25) < 0.01 for v in old), "%s" % [round(v, 2) for v in old])
+    check("levels: the new one doubles that at every scale",
+          all(v > 2.4 for v in new), "%s" % [round(v, 2) for v in new])
+
+    # An event must never need more bins than the level has.
+    for lvl, (lo, hi) in enumerate(r):
+        top = min(hi, 200.0)
+        check("levels: level %d's longest event fits its bins" % lvl,
+              top / 2.0 / (2 ** lvl) <= 15.0,
+              "%.1f bins" % (top / 2.0 / (2 ** lvl)))
 
 
 def test_soft_dice():
@@ -662,6 +719,8 @@ if __name__ == "__main__":
     test_diou()
     test_decode_spans()
     test_assign()
+    test_quality_focal()
+    test_level_ranges()
     test_soft_dice()
     test_sampler_sharding()
     test_tta_deshift()

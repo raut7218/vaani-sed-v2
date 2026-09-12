@@ -23,6 +23,8 @@ DEFAULT_POSTPROC = {
     "merge_gap": 0.0,
     "max_out": 16,
     "score_scale": 1.0,      # per-district calibration multiplies this
+    "quality_power": 0.0,    # exponent on the quality head in the span score;
+                             # 0 under QFL, where actionness already carries it
     # --- boundary branch ---
     "refine": False,         # snap endpoints onto the 20 ms branch's peaks
     "refine_window": 0.15,   # +- max(this * duration, refine_window_min) seconds
@@ -40,7 +42,8 @@ def _decode_to_host(out: dict, fps: float, pp: dict) -> tuple:
     has completed, which lets the caller queue the next batch's forward first.
     """
     n_frames = out["base_mask"].size(1)
-    spans, scores, _, _ = decode_spans(out, n_frames, fps)
+    spans, scores, _, _ = decode_spans(out, n_frames, fps,
+                                       q_power=float(pp["quality_power"]))
     ts = [spans.float(),
           (scores.float() * float(pp["score_scale"])).clamp(0, 1),
           out["count_logits"].float().softmax(-1)]

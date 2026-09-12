@@ -28,10 +28,37 @@ import torch
 import torch.nn.functional as F
 
 # Span length (in base frames) that each pyramid level is responsible for.
-# Level l has stride 2**l and 16 bins, so it can represent distances up to
-# 15 * 2**l base frames - comfortably above each range's upper edge.
-LEVEL_RANGES = [(0.0, 8.0), (8.0, 16.0), (16.0, 32.0), (32.0, 64.0), (64.0, 1e9)]
+#
+# The old table was [(0,8), (8,16), (16,32), (32,64), (64,inf)], which puts every
+# event at 4-8 strides long whatever its scale - so `d_start` and `d_end` each
+# used 2-4 of the 16 available bins and the rest of the distribution was dead
+# weight. That is the expensive part: the DFL's resolution is one bin, one bin is
+# one stride, and the metric's tolerance for a 1 s event is 0.2 s. At the level
+# that table assigns it (stride 160 ms) the whole tolerance is 1.25 bins wide.
+#
+# `level_ranges` assigns each event to the *finest* level whose bins can still
+# reach its boundaries. A point near the centre of an event of length L at stride
+# s has to express L / 2s in bins, so that level can own events up to
+# 2 * fill * (n_bins - 1) * s frames long. With 16 bins that moves a 1 s event
+# from a 160 ms stride to a 40 ms one and its tolerance from 1.25 bins to 5.
+#
+# The config's claim that "boundaries are regressed, so the 25 fps grid does not
+# cap boundary precision" is true of what a distribution can *represent* - the
+# expectation is continuous - and false of what it can be trained to resolve,
+# which scales with bin width. Bin width is the level's stride.
 CENTER_RADIUS = 1.5      # positives within this many strides of the span centre
+LEVEL_FILL = 0.75        # fraction of the bin range an event may occupy
+
+
+def level_ranges(n_bins: int, n_levels: int, fill: float = LEVEL_FILL) -> List[tuple]:
+    hi = [2.0 * fill * (n_bins - 1) * (2 ** lvl) for lvl in range(n_levels)]
+    out = [(0.0 if lvl == 0 else hi[lvl - 1], hi[lvl]) for lvl in range(n_levels)]
+    out[-1] = (out[-1][0], 1e9)
+    return out
+
+
+# Kept so the old assignment can still be run as an ablation.
+LEGACY_LEVEL_RANGES = [(0.0, 8.0), (8.0, 16.0), (16.0, 32.0), (32.0, 64.0), (64.0, 1e9)]
 
 TIER_GOLD, TIER_SILVER, TIER_BRONZE = 0, 1, 2
 
@@ -49,7 +76,8 @@ def level_point_coords(n_frames: int, n_levels: int, device) -> List[torch.Tenso
 @torch.no_grad()
 def assign_targets(spans: torch.Tensor, span_cls: torch.Tensor, tier: torch.Tensor,
                    masks: List[torch.Tensor], n_frames: int, n_class: int,
-                   n_bins: int) -> Dict[str, List[torch.Tensor]]:
+                   n_bins: int, ranges: List[tuple] | None = None
+                   ) -> Dict[str, List[torch.Tensor]]:
     """Match ground-truth spans to pyramid points.
 
     spans:     (B, M, 2) in base frames, padded with -1
@@ -64,9 +92,10 @@ def assign_targets(spans: torch.Tensor, span_cls: torch.Tensor, tier: torch.Tens
     device = spans.device
     B, M, _ = spans.shape
     n_levels = len(masks)
+    ranges = ranges if ranges is not None else level_ranges(n_bins, n_levels)
     pts = level_point_coords(n_frames, n_levels, device)
 
-    cls_t, ds_t, de_t, pos_t, qual_t, bw_t = [], [], [], [], [], []
+    cls_t, ds_t, de_t, pos_t, qual_t, bw_t, idx_t = [], [], [], [], [], [], []
     lengths = (spans[..., 1] - spans[..., 0]).clamp(min=1e-3)          # (B, M)
     valid_ev = (span_cls >= 0) & (tier.view(B, 1) != TIER_BRONZE)
 
@@ -78,7 +107,7 @@ def assign_targets(spans: torch.Tensor, span_cls: torch.Tensor, tier: torch.Tens
         stride = float(2 ** lvl)
         p = pts[lvl][: masks[lvl].size(1)]                             # (T,)
         T = p.numel()
-        lo, hi = LEVEL_RANGES[min(lvl, len(LEVEL_RANGES) - 1)]
+        lo, hi = ranges[min(lvl, len(ranges) - 1)]
 
         # Only `cls` needs zeroing: it is scattered into. The other five are
         # assigned outright below.
@@ -142,8 +171,10 @@ def assign_targets(spans: torch.Tensor, span_cls: torch.Tensor, tier: torch.Tens
         cls.scatter_(2, sel_cls.unsqueeze(-1), any_pos.unsqueeze(-1))
         cls[..., n_class] = any_pos                                # agnostic channel
         cls = cls * any_pos.unsqueeze(-1)
+        cls_idx = sel_cls * any_pos.long()                         # (B, T)
 
         m = masks[lvl]
+        idx_t.append(cls_idx * m.long())
         cls_t.append(cls * m.unsqueeze(-1))
         ds_t.append(ds * m)
         de_t.append(de * m)
@@ -152,7 +183,7 @@ def assign_targets(spans: torch.Tensor, span_cls: torch.Tensor, tier: torch.Tens
         bw_t.append(bw * m)
 
     return {"cls": cls_t, "d_start": ds_t, "d_end": de_t, "pos": pos_t,
-            "quality": qual_t, "bw": bw_t}
+            "quality": qual_t, "bw": bw_t, "cls_idx": idx_t}
 
 
 def sigmoid_focal(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
@@ -163,6 +194,30 @@ def sigmoid_focal(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     w = alpha * target + (1 - alpha) * (1 - target)
     loss = ce * w * (1 - pt).pow(gamma)
     return (loss * mask).sum()
+
+
+def quality_focal(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                  beta: float = 2.0) -> torch.Tensor:
+    """Generalized Focal Loss's classification term, with a soft IoU target.
+
+    The plain focal loss trains actionness against a hard 1 at every positive, so
+    a point whose decoded span has an IoU of 0.2 with its target is asked for the
+    same confidence as one at 0.9. The score that ranks candidates then cannot
+    tell them apart, and ranking is where this model loses: on the fold-0
+    checkpoint, choosing the right *number* of spans is worth +0.037 and choosing
+    the right *spans* is worth +0.28 over the same candidate pool.
+
+    A separate IoU head does not fix that, because it only ever sees positives -
+    it is never shown a bad span and has nothing to calibrate against. GFL's
+    answer is to put the quality *into* the classification target: the label for
+    a positive is its own IoU, negatives stay at 0, and one number then means
+    "there is an event here and it is well localised". The modulating factor is
+    |target - sigmoid|^beta rather than focal's (1 - pt)^gamma, so it vanishes
+    when the prediction matches the soft target instead of when it saturates.
+    """
+    p = logits.sigmoid()
+    ce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return (ce * (target - p).abs().pow(beta) * mask).sum()
 
 
 def diou_1d(pred_s: torch.Tensor, pred_e: torch.Tensor,
@@ -316,6 +371,10 @@ class SpanLoss:
         self.silver_bmap = float(w.get("silver_bmap_weight", 0.15))
         self.silver_frame = float(w.get("silver_frame_weight", 0.5))
         self.iou_quality = bool(w.get("iou_quality", True))
+        self.qfl = bool(w.get("qfl", True))
+        self.ranges = (LEGACY_LEVEL_RANGES if w.get("legacy_level_ranges") else
+                       level_ranges(n_bins, int(cfg["model"].get("n_levels", 5)),
+                                    float(w.get("level_fill", LEVEL_FILL))))
 
     def __call__(self, out: dict, batch: dict) -> tuple:
         tier = batch["tier"]
@@ -323,7 +382,7 @@ class SpanLoss:
         n_frames = out["base_mask"].size(1)
 
         tgt = assign_targets(batch["spans"], batch["span_cls"], tier, masks,
-                             n_frames, self.n_class, self.n_bins)
+                             n_frames, self.n_class, self.n_bins, self.ranges)
 
         n_pos = sum(t.sum() for t in tgt["pos"]).clamp(min=1.0)
         l_cls = out["cls"][0].new_zeros(())
@@ -341,8 +400,6 @@ class SpanLoss:
         # of extra elementwise ops on <7k points and issues no sync at all.
         for lvl in range(len(masks)):
             m = masks[lvl]
-            l_cls = l_cls + sigmoid_focal(out["cls"][lvl], tgt["cls"][lvl],
-                                          m.unsqueeze(-1))
             sel = tgt["pos"][lvl] > 0.5
             bw = tgt["bw"][lvl] * sel                       # gold 1.0, silver 0.25
             # Non-positive points are given a self-consistent unit interval so
@@ -356,6 +413,20 @@ class SpanLoss:
             te = torch.where(sel, tgt["d_end"][lvl], one)
             dl, iou = diou_1d(ps, pe, ts, te, return_iou=True)
             l_reg = l_reg + (dl * bw).sum()
+
+            if self.qfl:
+                # Soft classification target: the point's own span IoU, on its
+                # assigned class and on the agnostic channel. Negatives keep 0,
+                # which is what gives the head something to calibrate against.
+                q = (iou.detach().clamp(0, 1) * sel).unsqueeze(-1)
+                soft = torch.zeros_like(out["cls"][lvl])
+                soft.scatter_(2, tgt["cls_idx"][lvl].unsqueeze(-1), q)
+                soft[..., self.n_class] = q.squeeze(-1)
+                l_cls = l_cls + quality_focal(out["cls"][lvl], soft,
+                                              m.unsqueeze(-1))
+            else:
+                l_cls = l_cls + sigmoid_focal(out["cls"][lvl], tgt["cls"][lvl],
+                                              m.unsqueeze(-1))
 
             B, T = bw.shape
             nb = out["start_logits"][lvl].size(-1)

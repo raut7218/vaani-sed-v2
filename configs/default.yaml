@@ -109,6 +109,19 @@ loss:
                               # event 0.98 s vs gold's 0.45 s, coverage 0.585 vs
                               # 0.287, 29.6% starting at exactly 0.000 s
   iou_quality: true           # quality regresses span IoU, not centerness
+  qfl: true                   # classification target is the span's own IoU.
+                              # Measured on fold 0: over the same candidates,
+                              # the right *number* of spans is worth +0.037 and
+                              # the right *spans* +0.28, so ranking is where the
+                              # score is - and a separate quality head cannot fix
+                              # it because it only ever sees positives.
+  # Pyramid level assignment. The old fixed table put every event at 4-8 strides
+  # long whatever its scale, so the metric's tolerance was 1.25 DFL bins wide for
+  # everything above half a second. Deriving the ranges from the bin geometry
+  # instead - finest level whose bins still reach the boundaries - makes it 2.50
+  # bins for every event over 0.5 s.
+  level_fill: 0.75
+  legacy_level_ranges: false  # true reproduces the old [(0,8),(8,16),...] table
   # Silver's *tags* are as good as gold's; only its *timestamps* are unverified.
   # So silver is down-weighted on frame/boundary terms only - the boundary
   # down-weight itself lives in losses.py (0.25) where the spans are assigned.
@@ -137,6 +150,9 @@ postproc:
   merge_gap: 0.0              # v1's merging dilated spans by a median 0.20 s
   max_out: 16
   score_scale: 1.0            # overwritten per district by the calibrator
+  quality_power: 0.0          # exponent on the quality head in the span score.
+                              # 0 under QFL: actionness is already the joint
+                              # detection-and-localisation score there.
   # --- boundary branch, applied before SoftNMS ---
   # Both OFF by default: measured on the 24-epoch fold-0 run, refinement *costs*
   # score and does so monotonically in how much of it you do -

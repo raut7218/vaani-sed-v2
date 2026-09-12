@@ -247,8 +247,8 @@ def level_points(n_frames: int, n_levels: int, device) -> List[torch.Tensor]:
     return pts
 
 
-def decode_spans(out: dict, n_frames: int, fps: float) -> Tuple[torch.Tensor, torch.Tensor,
-                                                               torch.Tensor, torch.Tensor]:
+def decode_spans(out: dict, n_frames: int, fps: float, q_power: float = 0.5
+                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Turn head outputs into (spans_sec, scores, class_ids, level_ids).
 
     Returns flat tensors over all levels: spans (B, N, 2) in seconds, scores
@@ -268,15 +268,13 @@ def decode_spans(out: dict, n_frames: int, fps: float) -> Tuple[torch.Tensor, to
         agn = prob[..., -1]                                     # class-agnostic head
         percls = prob[..., :-1]
         cid = percls.argmax(dim=-1)
-        # actionness * sqrt(quality). Quality is what suppresses points that sit
-        # inside an event but far from its centre, where the boundary regression
-        # is least reliable; the square root keeps it a tie-breaker rather than
-        # letting it override actionness outright. (Written as the product of two
-        # square roots, which reads like a geometric mean and is not one - the
-        # `agn` factor appears in both halves. Left as-is because the exponents
-        # are the operating point every threshold downstream was chosen against;
-        # only the comment was wrong.)
-        sc = (agn * q.sigmoid()).clamp(min=1e-6).sqrt() * agn.sqrt()
+        # actionness * quality**q_power. Under Quality Focal Loss `agn` is
+        # already the joint "there is an event here and it is well localised"
+        # score, so q_power 0 is the right setting there and the separate head
+        # becomes a tie-breaker at most; without QFL the head is the only
+        # localisation signal in the ranking and wants its full weight. Left as a
+        # knob because which is better is a measurement, not a derivation.
+        sc = agn * q.sigmoid().clamp(min=1e-6).pow(q_power) if q_power else agn
         sc = sc * m
         spans.append(torch.stack([start, end], dim=-1))
         scores.append(sc)
