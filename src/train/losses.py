@@ -166,7 +166,7 @@ def sigmoid_focal(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
 
 
 def diou_1d(pred_s: torch.Tensor, pred_e: torch.Tensor,
-            tgt_s: torch.Tensor, tgt_e: torch.Tensor) -> torch.Tensor:
+            tgt_s: torch.Tensor, tgt_e: torch.Tensor, return_iou: bool = False):
     """1 - DIoU for intervals given as distances from a shared anchor point.
 
     Distance-IoU rather than plain IoU: when a prediction and its target do not
@@ -184,7 +184,8 @@ def diou_1d(pred_s: torch.Tensor, pred_e: torch.Tensor,
     c_pred = (pred_e - pred_s) / 2
     c_tgt = (tgt_e - tgt_s) / 2
     rho2 = (c_pred - c_tgt).pow(2)
-    return 1.0 - iou + rho2 / enclose.clamp(min=1e-6).pow(2)
+    loss = 1.0 - iou + rho2 / enclose.clamp(min=1e-6).pow(2)
+    return (loss, iou) if return_iou else loss
 
 
 def distribution_focal(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -232,6 +233,58 @@ def soft_dice(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
     return (per_clip * weight).sum() / weight.sum().clamp(min=1e-6)
 
 
+def boundary_targets(spans: torch.Tensor, valid: torch.Tensor, n_hi: int,
+                     mult: int, tier: torch.Tensor, silver_w: float,
+                     sigma: float = 1.0) -> tuple:
+    """Per-frame onset / offset targets on the refinement grid.
+
+    Returns (target (B, 2, n_hi), weight (B, 2, n_hi)).
+
+    A boundary is a Gaussian bump of width `sigma` refinement frames rather than
+    a single one-hot spike: the true boundary lies *between* frames, and a spike
+    makes the two frames straddling it fight over the same probability mass. The
+    bump lets the decode-time expectation land between them, which is the whole
+    point of running this branch at all.
+
+    Weighting, per boundary rather than per clip:
+
+    * gold (and the synthetic clips, which are gold by construction) - 1.0.
+    * silver - `silver_w`, because its spans are measurably coarser: median
+      event 0.98 s against gold's 0.45 s, coverage 0.585 against 0.287.
+    * any silver boundary sitting on a clip edge - 0.0. 29.6% of silver events
+      start at exactly 0.000 s and 20.4% end at exactly the clip duration;
+      those are the annotation tool's defaults, not audible transients, and
+      they are the single fastest way to teach an onset detector to fire on
+      silence.
+    """
+    B = spans.size(0)
+    device = spans.device
+    grid = torch.arange(n_hi, device=device).float().view(1, 1, n_hi)
+    on = spans[..., 0] * mult                                   # (B, M) hi frames
+    off = spans[..., 1] * mult
+    ok = (spans[..., 1] > spans[..., 0]) & (spans[..., 0] >= 0)
+    n_valid = (valid.sum(1) * mult).view(B, 1)                  # (B, 1)
+
+    is_gold = (tier.view(B, 1) == TIER_GOLD)
+    w_ev = torch.where(is_gold, torch.ones_like(on), torch.full_like(on, silver_w))
+    edge = 0.5 * mult                                           # within half a base frame
+    w_on = torch.where(is_gold | (on > edge), w_ev, torch.zeros_like(w_ev)) * ok
+    w_off = torch.where(is_gold | (off < n_valid - edge), w_ev, torch.zeros_like(w_ev)) * ok
+
+    def bump(pos, w):
+        g = torch.exp(-0.5 * ((grid - pos.unsqueeze(-1)) / sigma) ** 2)  # (B, M, n_hi)
+        g = g * (w > 0).unsqueeze(-1)
+        t = g.amax(dim=1)                                       # (B, n_hi)
+        # Each frame's weight is that of the boundary that claims it; frames no
+        # boundary claims keep weight 1 so they train as negatives.
+        wf = (g * w.unsqueeze(-1)).amax(dim=1)
+        return t, torch.where(t > 0.05, wf, torch.ones_like(wf))
+
+    t_on, wm_on = bump(on, w_on)
+    t_off, wm_off = bump(off, w_off)
+    return (torch.stack([t_on, t_off], 1), torch.stack([wm_on, wm_off], 1))
+
+
 class SpanLoss:
     """Assembles every term. Returns (total, logs) with logs kept on-device.
 
@@ -252,7 +305,10 @@ class SpanLoss:
         self.w_clip = float(w.get("clip", 0.5))
         self.w_speech = float(w.get("speech", 0.2))
         self.w_count = float(w.get("count", 0.2))
+        self.w_bmap = float(w.get("bmap", 1.0))
+        self.silver_bmap = float(w.get("silver_bmap_weight", 0.15))
         self.silver_frame = float(w.get("silver_frame_weight", 0.5))
+        self.iou_quality = bool(w.get("iou_quality", True))
 
     def __call__(self, out: dict, batch: dict) -> tuple:
         tier = batch["tier"]
@@ -291,7 +347,8 @@ class SpanLoss:
             pe = torch.where(sel, out["d_end"][lvl], one)
             ts = torch.where(sel, tgt["d_start"][lvl], one)
             te = torch.where(sel, tgt["d_end"][lvl], one)
-            l_reg = l_reg + (diou_1d(ps, pe, ts, te) * bw).sum()
+            dl, iou = diou_1d(ps, pe, ts, te, return_iou=True)
+            l_reg = l_reg + (dl * bw).sum()
 
             B, T = bw.shape
             nb = out["start_logits"][lvl].size(-1)
@@ -300,14 +357,26 @@ class SpanLoss:
                    + distribution_focal(out["end_logits"][lvl].reshape(B * T, nb),
                                         te.reshape(B * T)))
             l_dfl = l_dfl + (dfl.view(B, T) * bw).sum()
+            # Quality regresses the span's own IoU, not its centerness: the
+            # selector ranks on this number, so it has to mean "how good is this
+            # span" rather than "how centred is this point".
+            q_tgt = iou.detach().clamp(0, 1) if self.iou_quality else tgt["quality"][lvl]
             l_qual = l_qual + (F.binary_cross_entropy_with_logits(
-                out["quality"][lvl], tgt["quality"][lvl],
-                reduction="none") * bw).sum()
+                out["quality"][lvl], q_tgt, reduction="none") * bw).sum()
 
+        # The three boundary terms are weighted by `bw` (gold 1.0, silver 0.25),
+        # so they have to be normalised by the weight they actually carry, not by
+        # the raw positive count. Dividing by `n_pos` silently scaled all three
+        # by the batch's mean `bw` - about 0.69 under the 50/35 gold/silver
+        # quotas - and that is why `dfl` sat at 0.41 and `qual` at 0.35 for fifty
+        # epochs while every other term fell to 0.03: the head with the hardest
+        # job was getting two-thirds of the gradient it was configured for.
+        n_bw = sum((t * (p > 0.5)).sum() for t, p in zip(tgt["bw"], tgt["pos"])
+                   ).clamp(min=1e-3)
         l_cls = l_cls / n_pos
-        l_reg = l_reg / n_pos
-        l_dfl = l_dfl / (2 * n_pos)
-        l_qual = l_qual / n_pos
+        l_reg = l_reg / n_bw
+        l_dfl = l_dfl / (2 * n_bw)
+        l_qual = l_qual / n_bw
 
         # --- auxiliary frame-level terms -------------------------------------
         vmask = out["base_mask"]
@@ -341,6 +410,20 @@ class SpanLoss:
             sb = (sb * vmask).sum(1) / vmask.sum(1).clamp(min=1)
             l_speech = (sb * has_vad).sum() / has_vad.sum().clamp(min=1)
 
+        if "onset_logits" in out and self.w_bmap > 0:
+            n_hi = out["onset_logits"].size(1)
+            mult = n_hi / max(1, n_frames)
+            bt, bwt = boundary_targets(batch["spans"], vmask, n_hi, mult, tier,
+                                       self.silver_bmap)
+            blog = torch.stack([out["onset_logits"], out["offset_logits"]], 1)
+            hm = out["hi_mask"].unsqueeze(1)
+            # Focal, not plain BCE: two frames in a hundred are boundaries and an
+            # unweighted BCE converges to predicting none of them.
+            bl = sigmoid_focal(blog, bt, bwt * hm, alpha=0.5, gamma=2.0)
+            l_bmap = bl / (bt > 0.05).float().mul(hm).sum().clamp(min=1.0)
+        else:
+            l_bmap = out["cls"][0].new_zeros(())
+
         cnt = batch["n_events"].clamp(max=out["count_logits"].size(1) - 1)
         ce = F.cross_entropy(out["count_logits"], cnt, reduction="none")
         l_count = (ce * strong).sum() / strong.sum().clamp(min=1)
@@ -348,11 +431,13 @@ class SpanLoss:
         total = (self.w_cls * l_cls + self.w_reg * l_reg + self.w_dfl * l_dfl
                  + self.w_qual * l_qual + self.w_frame * l_frame
                  + self.w_dice * l_dice + self.w_clip * l_clip
-                 + self.w_speech * l_speech + self.w_count * l_count)
+                 + self.w_speech * l_speech + self.w_count * l_count
+                 + self.w_bmap * l_bmap)
 
         logs = {"loss": total.detach(), "cls": l_cls.detach(), "reg": l_reg.detach(),
                 "dfl": l_dfl.detach(), "qual": l_qual.detach(),
                 "frame": l_frame.detach(), "dice": l_dice.detach(),
                 "clip": l_clip.detach(), "speech": l_speech.detach(),
-                "count": l_count.detach(), "n_pos": n_pos.detach()}
+                "count": l_count.detach(), "bmap": l_bmap.detach(),
+                "n_pos": n_pos.detach()}
         return total, logs

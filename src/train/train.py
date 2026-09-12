@@ -364,6 +364,13 @@ def main() -> None:
         er = load_manifest(Path(extra) / "manifest.jsonl")
         for r in er:
             r["_root"] = str(extra)
+            # Its own sampling pool, but still gold for the loss: the synthetic
+            # clips' boundaries are exact by construction, so they deserve full
+            # boundary weight - what they must not do is *define* the gold pool.
+            # They outnumber the real gold clips 20000 to ~8900, so leaving them
+            # in it made 69% of every "gold" draw synthetic and set the epoch
+            # length from a pool that is mostly our own splicing.
+            r["pool"] = "synth"
         # Extras are train-only: validating on synthetic audio would measure how
         # well the model reads our own splicing, not the competition's task.
         tr_recs += er

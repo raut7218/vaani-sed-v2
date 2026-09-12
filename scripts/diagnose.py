@@ -44,7 +44,8 @@ from src.data.labels import LabelEncoder                                  # noqa
 from src.evaluation.metrics import evaluate                               # noqa: E402
 from src.infer.predict import load_checkpoint                             # noqa: E402
 from src.infer.runner import candidates_to_events, run_loader             # noqa: E402
-from src.postproc.calibrate import apply_scales, calibrate                # noqa: E402
+from src.postproc.calibrate import (apply_scales, calibrate,               # noqa: E402
+                                    priors_from_records)
 
 BUCKETS = [(0, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 4.0), (4.0, 1e9)]
 
@@ -123,8 +124,12 @@ def main() -> None:
 
     le = LabelEncoder(expand_vehicle=bool(d.get("expand_vehicle", True)))
     recs = load_manifest(Path(args.data) / "manifest.jsonl")
-    _, va = split_manifest(recs, fold=args.fold, n_folds=int(d.get("n_folds", 5)),
-                           seed=int(cfg["seed"]))
+    tr, va = split_manifest(recs, fold=args.fold, n_folds=int(d.get("n_folds", 5)),
+                            seed=int(cfg["seed"]))
+    priors = priors_from_records(tr, clip_len=float(d["clip_len"]))
+    tier_of = {r["uid"]: r.get("tier", "bronze") for r in va}
+    print("operating-point priors measured on the train split: "
+          "%.2f events/clip, %.3f coverage" % priors)
     ds = VaaniSpanDataset(va, root=args.data, le=le, clip_len=float(d["clip_len"]),
                           sr=int(d["sr"]), fps=fps, train=False)
     ld = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
@@ -141,7 +146,7 @@ def main() -> None:
 
     cands = run_loader(model, ld, device, fps, cfg.get("postproc"))
     if not args.no_calibrate:
-        sc = calibrate(cands, cfg.get("postproc", {}))
+        sc = calibrate(cands, cfg.get("postproc", {}), priors=priors)
         cands = apply_scales(cands, sc)
         g = sc["_global"]
         print("calibration: global scale %.2f, slack %+d, %d districts fitted"
@@ -159,6 +164,16 @@ def main() -> None:
     verdict = "BEATS" if r["score"] > const["score"] else "*** LOSES TO ***"
     print("model %s the whole-clip heuristic by %+.4f"
           % (verdict, r["score"] - const["score"]))
+    # Gold and silver are different annotation regimes, not different confidence
+    # in the same one: gold's median event is 0.45 s against silver's 0.98 s, and
+    # its coverage 0.287 against 0.585. One headline number averages over that.
+    for tier in ("gold", "silver"):
+        keys = [u for u in refs if tier_of.get(u) == tier]
+        if not keys:
+            continue
+        rt = evaluate({u: preds[u] for u in keys}, {u: refs[u] for u in keys})
+        print("  %-6s n=%-6d F1 %.4f  Dice %.4f  score %.4f"
+              % (tier, len(keys), rt["event_f1"], rt["segment_dice"], rt["score"]))
 
     print("\n=== detection vs localisation ===")
     strict, loose, tot = recall_breakdown(preds, refs)

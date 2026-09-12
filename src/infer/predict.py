@@ -27,7 +27,9 @@ from src.infer.runner import (DEFAULT_POSTPROC, candidates_to_events,      # noq
                               fuse_candidates, run_loader)
 from src.models.encoders import build_encoder                              # noqa: E402
 from src.models.span_model import build_model                              # noqa: E402
-from src.postproc.calibrate import apply_scales, calibrate                 # noqa: E402
+from src.postproc.calibrate import (PRIOR_COVERAGE,                          # noqa: E402
+                                    PRIOR_EVENTS_PER_CLIP, apply_scales,
+                                    calibrate)
 
 AUDIO_EXT = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
 
@@ -181,8 +183,9 @@ def main() -> None:
     n = [len(v) for v in preds.values()]
     cov = [sum(b - a for a, b in preds[u]) / max(fused[u]["duration"], 1e-6)
            for u in uids]
-    print("[predict] events/clip %.2f (prior 1.22) | coverage %.3f (prior 0.52) "
-          "| empty %.1f%%" % (float(np.mean(n)), float(np.mean(cov)),
+    print("[predict] events/clip %.2f (prior %.2f) | coverage %.3f (prior %.2f) "
+          "| empty %.1f%%" % (float(np.mean(n)), PRIOR_EVENTS_PER_CLIP,
+                              float(np.mean(cov)), PRIOR_COVERAGE,
                               100.0 * float(np.mean([x == 0 for x in n]))))
 
 

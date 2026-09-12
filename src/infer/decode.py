@@ -16,6 +16,7 @@ exactly one) and we keep that many.
 """
 from __future__ import annotations
 
+import math
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -172,4 +173,71 @@ def finalise(spans: np.ndarray, scores: np.ndarray, duration: float,
             continue
         out.append([round(a, 3), round(b, 3)])
     out.sort(key=lambda e: (e[0], e[1]))
+    return out
+
+
+def refine_boundaries(spans: np.ndarray, onset: np.ndarray, offset: np.ndarray,
+                      hi_fps: float, duration: float, window_frac: float = 0.25,
+                      window_min: float = 0.08, peak_min: float = 0.20,
+                      temperature: float = 4.0) -> np.ndarray:
+    """Snap each regressed endpoint onto the nearest boundary-branch peak.
+
+    The pyramid proposes at 40 ms and the branch runs at 20 ms, but resolution is
+    not really the point - the point is that "where is the onset" is an easier
+    question than "how far away is the onset", and the two heads fail
+    independently. Refinement only ever moves an endpoint inside the metric's own
+    tolerance window, so a confident-but-wrong branch cannot turn a matching span
+    into a missing one; the worst it can do is fail to help.
+
+    The new position is a softmax-weighted mean of the frame positions in the
+    window, not an argmax - the boundary sits between frames and the metric
+    measures the distance in seconds, so quantising to the 20 ms grid would throw
+    away a third of the tolerance on the shortest events. Endpoints whose window
+    holds no peak above `peak_min` are left exactly where the regression put them.
+    """
+    if len(spans) == 0:
+        return spans
+    out = spans.astype("float64").copy()
+    n = len(onset)
+    for i, (a, b) in enumerate(out):
+        w = max(window_frac * (b - a), window_min)
+        for j, (pos, prob) in enumerate(((a, onset), (b, offset))):
+            lo = max(0, int(math.floor((pos - w) * hi_fps)))
+            hi = min(n, int(math.ceil((pos + w) * hi_fps)) + 1)
+            if hi - lo < 2:
+                continue
+            seg = prob[lo:hi]
+            if seg.max() < peak_min:
+                continue
+            e = np.exp(temperature * (seg - seg.max()))
+            t = (np.arange(lo, hi) + 0.5) / hi_fps
+            out[i, j] = float((e * t).sum() / e.sum())
+    out[:, 0] = np.clip(out[:, 0], 0.0, duration)
+    out[:, 1] = np.clip(out[:, 1], 0.0, duration)
+    bad = out[:, 1] <= out[:, 0]
+    out[bad] = spans[bad]
+    return out.astype("float32")
+
+
+def boundary_agreement(spans: np.ndarray, onset: np.ndarray, offset: np.ndarray,
+                       hi_fps: float, tol_frac: float = 0.2,
+                       tol_min: float = 0.05) -> np.ndarray:
+    """How well each span's endpoints line up with the branch's peaks, in [0, 1].
+
+    Read at exactly the metric's tolerance, so this is a direct estimate of "will
+    this span match". Multiplied into the candidate score it ranks spans by how
+    likely they are to *score*, which is what count-based selection and SoftNMS
+    both need and what actionness alone cannot say.
+    """
+    if len(spans) == 0:
+        return np.zeros((0,), "float32")
+    n, out = len(onset), np.zeros(len(spans), "float32")
+    for i, (a, b) in enumerate(spans):
+        tol = max(tol_frac * (b - a), tol_min)
+        v = 1.0
+        for pos, prob in ((a, onset), (b, offset)):
+            lo = max(0, int((pos - tol) * hi_fps))
+            hi = min(n, int((pos + tol) * hi_fps) + 1)
+            v *= float(prob[lo:hi].max()) if hi > lo else 0.0
+        out[i] = math.sqrt(max(v, 0.0))
     return out

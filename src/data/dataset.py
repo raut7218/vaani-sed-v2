@@ -290,10 +290,15 @@ class TierBatchSampler(Sampler):
         self.world_size = max(1, int(world_size))
         self.by_tier: Dict[str, List[int]] = {}
         for i, r in enumerate(self.records):
-            self.by_tier.setdefault(r.get("tier", "bronze"), []).append(i)
+            # `pool` overrides `tier` for *sampling* only. The two are different
+            # questions: a tier says how far to trust a clip's timestamps, a pool
+            # says how often to draw it.
+            self.by_tier.setdefault(r.get("pool") or r.get("tier", "bronze"),
+                                    []).append(i)
         self.by_tier = {k: v for k, v in self.by_tier.items() if v}
 
-        quotas = quotas or {"gold": 0.5, "silver": 0.35, "bronze": 0.15}
+        quotas = quotas or {"gold": 0.35, "silver": 0.35, "bronze": 0.10,
+                            "synth": 0.20}
         quotas = {k: v for k, v in quotas.items() if k in self.by_tier and v > 0}
         tot = sum(quotas.values()) or 1.0
         raw = {k: self.batch_size * v / tot for k, v in quotas.items()}

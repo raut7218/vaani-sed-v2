@@ -6,7 +6,8 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from src.infer.decode import (finalise, merge_close, select_by_count, soft_nms_1d,
+from src.infer.decode import (boundary_agreement, finalise, merge_close,
+                              refine_boundaries, select_by_count, soft_nms_1d,
                               wbf_1d)
 from src.models.trident import decode_spans
 
@@ -21,6 +22,12 @@ DEFAULT_POSTPROC = {
     "merge_gap": 0.0,
     "max_out": 16,
     "score_scale": 1.0,      # per-district calibration multiplies this
+    # --- boundary branch ---
+    "refine": True,          # snap endpoints onto the 20 ms branch's peaks
+    "refine_window": 0.25,   # +- max(this * duration, refine_window_min) seconds
+    "refine_window_min": 0.08,
+    "refine_peak_min": 0.20,
+    "agree_weight": 0.5,     # exponent on boundary agreement in the span score
 }
 
 
@@ -33,24 +40,37 @@ def _decode_to_host(out: dict, fps: float, pp: dict) -> tuple:
     """
     n_frames = out["base_mask"].size(1)
     spans, scores, _, _ = decode_spans(out, n_frames, fps)
-    ts = (spans.float(),
+    ts = [spans.float(),
           (scores.float() * float(pp["score_scale"])).clamp(0, 1),
-          out["count_logits"].float().softmax(-1))
+          out["count_logits"].float().softmax(-1)]
+    if "onset_logits" in out:
+        hm = out["hi_mask"]
+        ts.append(torch.stack([out["onset_logits"].float().sigmoid() * hm,
+                               out["offset_logits"].float().sigmoid() * hm], dim=1))
+    # The refinement grid spans the whole padded window, not the clip's own
+    # duration, so its frame rate is a property of the model - deriving it from
+    # `duration` on the host would shift every refined boundary on any clip
+    # shorter than the window.
+    hi_fps = (out["onset_logits"].size(1) * fps / n_frames) if "onset_logits" in out else 0.0
+    ts = tuple(ts)
     if ts[0].device.type != "cuda":
-        return ts, None
+        return (ts, hi_fps), None
     host = tuple(torch.empty(t.shape, dtype=t.dtype, pin_memory=True) for t in ts)
     for h, t in zip(host, ts):
         h.copy_(t, non_blocking=True)
     ev = torch.cuda.Event()
     ev.record()
-    return host, ev
+    return (host, hi_fps), ev
 
 
 def _host_to_candidates(host: tuple, event, durations: np.ndarray,
                         pp: dict, shift: float = 0.0) -> List[dict]:
     if event is not None:
         event.synchronize()
-    spans, scores, counts = (t.numpy() for t in host)
+    host, hi_fps = host
+    arrays = [t.numpy() for t in host]
+    spans, scores, counts = arrays[0], arrays[1], arrays[2]
+    bmap = arrays[3] if len(arrays) > 3 else None
     res = []
     for i in range(spans.shape[0]):
         dur = float(durations[i])
@@ -58,6 +78,19 @@ def _host_to_candidates(host: tuple, event, durations: np.ndarray,
         ok = (c > 1e-4) & (s[:, 1] > s[:, 0])
         s, c = s[ok] - shift, c[ok]
         s = np.clip(s, 0.0, dur)
+        if bmap is not None:
+            on, off = bmap[i, 0], bmap[i, 1]
+            # Rank first, then move: agreement has to be read at the boundaries
+            # the detector actually proposed, or every candidate gets credit for
+            # a peak that refinement dragged it onto.
+            aw = float(pp["agree_weight"])
+            if aw > 0:
+                c = c * np.maximum(boundary_agreement(s, on, off, hi_fps), 1e-3) ** aw
+            if bool(pp["refine"]):
+                s = refine_boundaries(s, on, off, hi_fps, dur,
+                                      window_frac=float(pp["refine_window"]),
+                                      window_min=float(pp["refine_window_min"]),
+                                      peak_min=float(pp["refine_peak_min"]))
         s, c = soft_nms_1d(s, c, sigma=float(pp["nms_sigma"]),
                            iou_thr=float(pp["nms_iou"]),
                            max_out=int(pp["max_out"]))

@@ -32,10 +32,39 @@ import numpy as np
 
 from src.infer.runner import candidates_to_events
 
-# Priors measured on the annotated corpus (class-agnostic, per clip).
-PRIOR_EVENTS_PER_CLIP = 1.22
-PRIOR_COVERAGE = 0.52
+# Fallback priors, used only when nothing measured is supplied. Prefer
+# `priors_from_records`: these two constants were carried over from v1, and on
+# the fold-0 validation set the reference is 1.44 events per clip against the
+# 1.22 written here. Fitting to a prior that is 15% low makes the calibrator
+# *remove* true positives - measured on the v2 checkpoint it turned 1.1881 into
+# 1.1647, cutting fp 9942 -> 8636 but tp 9153 -> 8513.
+PRIOR_EVENTS_PER_CLIP = 1.44
+PRIOR_COVERAGE = 0.55
 MIN_CLIPS_PER_GROUP = 30        # below this, a group's statistics are noise
+
+
+def priors_from_records(records, clip_len: float | None = None) -> tuple:
+    """(events/clip, coverage) measured on a manifest.
+
+    The operating point the calibrator aims at should come from the data being
+    modelled, not from a constant that was true of some earlier split. Pass the
+    *training* records: they are the only labelled sample of the same annotation
+    process the test set went through.
+    """
+    n_ev, cov = [], []
+    for r in records:
+        ev = r.get("events") or []
+        dur = float(r.get("duration") or 0.0)
+        if clip_len:
+            dur = min(dur, float(clip_len))
+        if dur <= 0:
+            continue
+        n_ev.append(len(ev))
+        cov.append(min(1.0, sum(min(e["end"], dur) - min(e["start"], dur)
+                                for e in ev) / dur))
+    if not n_ev:
+        return PRIOR_EVENTS_PER_CLIP, PRIOR_COVERAGE
+    return float(np.mean(n_ev)), float(np.mean(cov))
 
 
 def district_of(uid: str) -> str:
@@ -56,13 +85,14 @@ def _stats(cands: Sequence[dict], pp: dict) -> tuple:
     return float(np.mean(n_ev)), float(np.mean(cov))
 
 
-def _cost(n_ev: float, cov: float) -> float:
-    return (((n_ev - PRIOR_EVENTS_PER_CLIP) / PRIOR_EVENTS_PER_CLIP) ** 2
-            + ((cov - PRIOR_COVERAGE) / PRIOR_COVERAGE) ** 2)
+def _cost(n_ev: float, cov: float, priors: tuple) -> float:
+    p_ev, p_cov = priors
+    return (((n_ev - p_ev) / p_ev) ** 2 + ((cov - p_cov) / p_cov) ** 2)
 
 
 def _fit_group(cands: Sequence[dict], base_pp: dict,
-               scale_grid: Sequence[float], slack_grid: Sequence[int]) -> dict:
+               scale_grid: Sequence[float], slack_grid: Sequence[int],
+               priors: tuple) -> dict:
     """Fit the two knobs that actually move the operating point.
 
     `score_scale` alone is not enough: when `count_weight` is 1.0 the number of
@@ -75,7 +105,7 @@ def _fit_group(cands: Sequence[dict], base_pp: dict,
         for s in scale_grid:
             pp = {**base_pp, "score_scale": s, "count_slack": slack}
             scaled = [{**c, "scores": np.clip(c["scores"] * s, 0, 1)} for c in cands]
-            c = _cost(*_stats(scaled, pp))
+            c = _cost(*_stats(scaled, pp), priors)
             if c < best_cost:
                 best_cost = c
                 best = {"score_scale": float(s), "count_slack": int(slack)}
@@ -85,13 +115,15 @@ def _fit_group(cands: Sequence[dict], base_pp: dict,
 def calibrate(cands: Dict[str, dict], base_pp: dict,
               scale_grid: Sequence[float] | None = None,
               slack_grid: Sequence[int] | None = None,
-              per_district: bool = True) -> Dict[str, dict]:
+              per_district: bool = True,
+              priors: tuple | None = None) -> Dict[str, dict]:
     """Return {district: {"score_scale": .., "count_slack": ..}} plus '_global'."""
     scale_grid = scale_grid if scale_grid is not None else list(np.round(np.arange(0.5, 2.51, 0.25), 2))
     slack_grid = slack_grid if slack_grid is not None else [-1, 0, 1, 2]
+    priors = priors or (PRIOR_EVENTS_PER_CLIP, PRIOR_COVERAGE)
     uids = list(cands)
     out: Dict[str, dict] = {"_global": _fit_group([cands[u] for u in uids], base_pp,
-                                                  scale_grid, slack_grid)}
+                                                  scale_grid, slack_grid, priors)}
     if not per_district:
         return out
 
@@ -103,7 +135,8 @@ def calibrate(cands: Dict[str, dict], base_pp: dict,
             # A 3-clip district cannot support its own operating point; the
             # global one is a far better estimate than an overfitted local one.
             continue
-        out[g] = _fit_group([cands[u] for u in us], base_pp, scale_grid, slack_grid)
+        out[g] = _fit_group([cands[u] for u in us], base_pp, scale_grid,
+                            slack_grid, priors)
     return out
 
 
@@ -116,3 +149,47 @@ def apply_scales(cands: Dict[str, dict], scales: Dict[str, dict]) -> Dict[str, d
                   "scores": np.clip(c["scores"] * float(s.get("score_scale", 1.0)), 0, 1),
                   "pp_override": {"count_slack": int(s.get("count_slack", 1))}}
     return out
+
+
+def fit_postproc(cands: Dict[str, dict], refs: Dict[str, list], base_pp: dict,
+                 grids: Dict[str, Sequence] | None = None) -> dict:
+    """Tune the post-processor against the metric itself, on labelled data.
+
+    Prior-matching exists because the test set has no labels. Validation does,
+    and there is no reason to aim at a proxy when the target is available: this
+    coordinate-descends the knobs that move the score, one at a time, re-scoring
+    with the real `evaluate` at every step. The result is what ships in the
+    checkpoint's config, and the transductive calibrator then only has to correct
+    the residual district-to-district drift on top of it.
+    """
+    from src.evaluation.metrics import evaluate
+
+    # Only the knobs `candidates_to_events` itself reads. Refinement, boundary
+    # agreement and SoftNMS all run earlier, in `_host_to_candidates`, against
+    # the raw model output - re-running them per trial would mean re-running
+    # SoftNMS on every clip for every trial, so those are swept once offline
+    # against cached candidates instead of here.
+    grids = grids or {
+        "count_slack": [-1, 0, 1, 2],
+        "count_weight": [0.0, 0.5, 0.75, 1.0],
+        "score_floor": [0.02, 0.05, 0.1, 0.2, 0.35],
+        "min_dur": [0.03, 0.08, 0.15],
+        "merge_gap": [0.0, 0.05, 0.1],
+    }
+    pp = dict(base_pp)
+
+    def score_of(cfg: dict) -> float:
+        preds = {u: candidates_to_events(c, cfg) for u, c in cands.items()}
+        return evaluate({u: preds[u] for u in refs}, refs)["score"]
+
+    best = score_of(pp)
+    for _ in range(2):                       # two passes: the knobs interact
+        for key, values in grids.items():
+            cur = pp.get(key)
+            for v in values:
+                if v == cur:
+                    continue
+                s = score_of({**pp, key: v})
+                if s > best + 1e-5:
+                    best, pp[key] = s, v
+    return {"pp": pp, "score": best}

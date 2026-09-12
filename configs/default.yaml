@@ -36,17 +36,28 @@ model:
   n_base_layers: 2
   n_head: 8
   n_bins: 16                  # boundary distribution bins per level
-  dropout: 0.1
+  dropout: 0.15               # 0.10 -> 0.15: the 50-epoch run peaked at epoch 15
+                              # (1.1881) and fell to 1.0646 by epoch 50 while the
+                              # train loss halved. That is the regularisation
+                              # budget being 35 epochs short, not a schedule bug.
+  boundary_branch: true       # 20 ms onset/offset head; see BoundaryBranch
+  boundary_mult: 2            # refinement grid = this x the 25 fps detection grid
+  dgqp: true                  # GFLv2 quality from the boundary distributions
   specaug: true
   flux: true                  # spectral-flux onset channels alongside the mel
   max_count: 8
 
 train:
-  epochs: 50                  # 12 frozen + 38 unfrozen: ~11 h on 2x T4 at batch
-                              # 48/GPU, inside one 12 h Kaggle session
+  # Measured, from the 50-epoch fold-0 run: best val 1.1881 at epoch 15, then a
+  # monotone slide to 1.0646 at epoch 50. Seven of that session's eleven hours
+  # were spent making the model worse. The unfreeze at epoch 12 bought +0.0025
+  # and started the slide, so it now happens late and at half the encoder LR,
+  # with the frozen phase - which was still improving when it ended - given the
+  # room instead.
+  epochs: 40
   batch_size: 16              # per GPU under torchrun
   lr: 0.0005
-  encoder_lr_scale: 0.05      # pretrained encoders train at 5% of the head LR
+  encoder_lr_scale: 0.02      # 0.05 was enough to start the overfit slide
   weight_decay: 0.05
   warmup_steps: 800
   grad_clip: 5.0
@@ -60,21 +71,26 @@ train:
   log_every: 100                  # steps between progress lines (it/s, data-wait, memory)
   # Validation runs on every GPU (each scores its shard) on the EMA weights.
   # Early epochs only monitor; the checkpoint that wins comes from the end.
-  eval_every: 5               # evaluate every N epochs (and always the last) ...
+  eval_every: 2               # evaluate every N epochs (and always the last) ...
   eval_last: 0                # ... plus every epoch for the final N
   eval_raw: false             # also score the raw (non-EMA) weights: 2x eval cost
   eval_batch_size: 0          # 0 = 2 x batch_size (no activations kept for backward)
-  unfreeze_epoch: 12          # freeze -> low-LR unfreeze (the ATST-SED schedule)
+  unfreeze_epoch: 30          # freeze -> low-LR unfreeze (the ATST-SED schedule)
   unfreeze_blocks: 4
   checkpoint_unfrozen: false  # recompute the trainable blocks' activations in
                               # backward (never the frozen stack) - only if the
                               # unfrozen phase runs out of memory
   unfreeze_grad_accum: 1      # micro-batches per step once unfrozen, the last
                               # resort for memory after checkpoint_unfrozen
+  # Sampling pools, not loss tiers - `synth` is gold-tier for the loss. The
+  # 20000 synthetic clips used to sit inside the gold pool and outnumber the
+  # ~8900 real gold clips there, so 69% of every gold draw was our own splicing
+  # and the epoch length was set by it.
   tier_quotas:
-    gold: 0.5                 # gold up-weighted vs v1: it is the only tier whose
-    silver: 0.35              # boundaries can supervise the regression head
-    bronze: 0.15
+    gold: 0.35
+    silver: 0.35              # val is 85% silver; training at 50% gold was a
+    bronze: 0.10              # train/eval distribution mismatch on top of it
+    synth: 0.20
 
 loss:
   cls: 1.0                    # focal on actionness
@@ -86,6 +102,11 @@ loss:
   clip: 0.5                   # attention-pooled clip tags (the bronze tier's route in)
   speech: 0.2                 # VAD auxiliary head
   count: 0.2                  # events-per-clip head
+  bmap: 1.0                   # per-frame onset/offset map on the 20 ms grid
+  silver_bmap_weight: 0.15    # silver's spans are measurably coarser: median
+                              # event 0.98 s vs gold's 0.45 s, coverage 0.585 vs
+                              # 0.287, 29.6% starting at exactly 0.000 s
+  iou_quality: true           # quality regresses span IoU, not centerness
   # Silver's *tags* are as good as gold's; only its *timestamps* are unverified.
   # So silver is down-weighted on frame/boundary terms only - the boundary
   # down-weight itself lives in losses.py (0.25) where the spans are assigned.
@@ -107,3 +128,9 @@ postproc:
   merge_gap: 0.0              # v1's merging dilated spans by a median 0.20 s
   max_out: 16
   score_scale: 1.0            # overwritten per district by the calibrator
+  # --- boundary branch, applied before SoftNMS ---
+  refine: true                # snap endpoints onto the branch's peaks
+  refine_window: 0.25         # search +- max(this * duration, refine_window_min)
+  refine_window_min: 0.08     # never wider than the metric's own tolerance
+  refine_peak_min: 0.20       # below this the window holds no boundary: don't move
+  agree_weight: 0.5           # exponent on boundary agreement in the span score
