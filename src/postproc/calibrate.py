@@ -172,6 +172,7 @@ def fit_postproc(cands: Dict[str, dict], refs: Dict[str, list], base_pp: dict,
     grids = grids or {
         "count_slack": [-1, 0, 1, 2],
         "count_weight": [0.0, 0.5, 0.75, 1.0],
+        "count_mode": ["expected", "argmax"],
         "score_floor": [0.02, 0.05, 0.1, 0.2, 0.35],
         "min_dur": [0.03, 0.08, 0.15],
         "merge_gap": [0.0, 0.05, 0.1],

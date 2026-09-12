@@ -121,6 +121,9 @@ postproc:
   nms_iou: 0.35
   score_floor: 0.05
   count_weight: 1.0           # 1.0 = let the count head decide how many events
+  count_mode: expected        # the argmax is 1 almost everywhere (71% of silver
+                              # clips hold one event), which is how the last run
+                              # emitted 1.18 events/clip against a 1.44 reference
   count_slack: 0               # trust the count head. A duplicate span is a
                                # guaranteed false positive under 1-to-1 matching
                                # *and* inflates coverage, so hedging upward loses

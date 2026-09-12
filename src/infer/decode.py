@@ -116,15 +116,29 @@ def wbf_1d(span_sets: Sequence[np.ndarray], score_sets: Sequence[np.ndarray],
 
 def select_by_count(spans: np.ndarray, scores: np.ndarray, count_probs: np.ndarray,
                     min_score: float = 0.05, slack: int = 1,
-                    count_weight: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+                    count_weight: float = 1.0, count_mode: str = "expected"
+                    ) -> Tuple[np.ndarray, np.ndarray]:
     """Keep as many spans as the count head says the clip contains.
 
     `count_weight` blends between pure count-head control (1.0) and a plain
     score floor (0.0), so the ablation is one number.
+
+    `count_mode` picks how the head's distribution becomes an integer. The argmax
+    minimises 0-1 error on a single clip, but 71% of silver clips hold exactly
+    one event, so the argmax is 1 almost everywhere and the corpus rate collapses
+    to it - the previous run emitted 1.18 events per clip against a reference of
+    1.44, and every one of that shortfall is a false negative. The expectation
+    minimises squared error instead, which is the one that makes the *rate* come
+    out right. Both are here; the tuner picks.
     """
     if len(spans) == 0:
         return spans, scores
-    k_pred = int(np.argmax(count_probs)) if count_probs is not None else 1
+    if count_probs is None:
+        k_pred = 1
+    elif count_mode == "expected":
+        k_pred = int(round(float((np.arange(len(count_probs)) * count_probs).sum())))
+    else:
+        k_pred = int(np.argmax(count_probs))
     k_score = int((scores >= min_score).sum())
     k = int(round(count_weight * k_pred + (1 - count_weight) * k_score)) + slack
     k = max(0, min(k, len(spans)))

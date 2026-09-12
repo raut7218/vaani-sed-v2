@@ -17,6 +17,7 @@ DEFAULT_POSTPROC = {
     "nms_iou": 0.35,
     "score_floor": 0.05,
     "count_weight": 1.0,
+    "count_mode": "expected",   # "expected" or "argmax"; see select_by_count
     "count_slack": 0,
     "min_dur": 0.03,
     "merge_gap": 0.0,
@@ -123,7 +124,8 @@ def candidates_to_events(cand: dict, pp: dict | None = None) -> List[List[float]
     s, c = select_by_count(cand["spans"], cand["scores"], cand.get("count"),
                            min_score=float(pp["score_floor"]),
                            slack=int(pp["count_slack"]),
-                           count_weight=float(pp["count_weight"]))
+                           count_weight=float(pp["count_weight"]),
+                           count_mode=str(pp["count_mode"]))
     s = merge_close(s, gap=float(pp["merge_gap"]))
     return finalise(s, c[:len(s)], cand["duration"], min_dur=float(pp["min_dur"]))
 
