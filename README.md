@@ -50,6 +50,13 @@ checkpoint at **1.1881** (fold 0) and a second round of measurements, several of
 which contradict assumptions in this file. They are recorded here so the dead
 ends are not re-explored.
 
+**The head is not the limit.** Overfit deliberately to a handful of clips, the
+span head places boundaries to **4.2 ms** against a 180 ms tolerance
+(`tests/test_overfit.py`). Sub-tolerance boundaries are representable and
+learnable; the 0.19 s the trained model carries is a *generalisation* gap, not a
+ceiling of the architecture. That is worth knowing before redesigning the head -
+one such redesign (the refinement branch below) was built and did not pay.
+
 **The score is bounded by boundary jitter, and the amount is known.** Push the
 real references through the real scorer with synthetic noise on every boundary:
 

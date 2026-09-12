@@ -66,9 +66,10 @@ def recall_breakdown(preds, refs):
     return strict, loose, tot
 
 
-def boundary_errors(preds, refs):
+def boundary_errors(preds, refs, keys=None):
     on, off = [], []
-    for uid, ref in refs.items():
+    for uid, ref in (refs.items() if keys is None else
+                     ((u, refs[u]) for u in keys)):
         pv = preds.get(uid, [])
         for a, b in ref:
             d = b - a
@@ -190,6 +191,20 @@ def main() -> None:
               "detection problem. More data will not fix it.")
 
     print("\n=== boundary error ===")
+    # Per tier, because gold and silver are different annotation regimes and the
+    # head itself is not the limit: overfit to a handful of clips it places
+    # boundaries to 4.2 ms (tests/test_overfit.py). Whatever jitter shows up here
+    # is a generalisation gap, and if it is much wider on silver than on gold
+    # then a large part of it is the annotation, not the model.
+    for tier in ("gold", "silver"):
+        ks = [u for u in refs if tier_of.get(u) == tier]
+        if not ks:
+            continue
+        a, b = boundary_errors(preds, refs, ks)
+        if len(a):
+            print("  %-6s onset MAE %.3f median %+.3f | offset MAE %.3f median %+.3f"
+                  % (tier, np.abs(a).mean(), np.median(a),
+                     np.abs(b).mean(), np.median(b)))
     on, off = boundary_errors(preds, refs)
     if len(on):
         print("onset  mean %+.3f  median %+.3f  MAE %.3f  p10 %+.3f  p90 %+.3f"
