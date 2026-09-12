@@ -12,7 +12,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from src.evaluation.metrics import clip_dice, evaluate, match_events   # noqa: E402
 from src.infer.decode import (boundary_agreement, finalise,          # noqa: E402
@@ -181,6 +182,61 @@ def test_assign():
     check("assign: d_start/d_end reconstruct the span",
           abs((idx - ds) - 10.0) < 1e-4 and abs((idx + de) - 14.0) < 1e-4,
           "%.3f %.3f" % (idx - ds, idx + de))
+
+
+def test_loss_under_autocast():
+    """The whole loss must survive mixed precision.
+
+    Everything in `assign_targets` is fp32 (it is built from the batch) while the
+    model's outputs are fp16 under autocast, and the two meet in several places -
+    `scatter_` refuses to mix them at all, and `torch.where` silently promotes.
+    A CPU smoke test runs with autocast off and sees none of it, so this is the
+    only place that class of bug shows up before a GPU session is spent on it.
+    """
+    import yaml
+    from src.data.labels import LabelEncoder
+    from src.models.span_model import build_model
+    from src.train.losses import SpanLoss
+
+    cfg = yaml.safe_load(open(ROOT / "configs" / "default.yaml"))
+    cfg["model"].update(encoders=[], d_model=64, n_levels=3, n_base_layers=1)
+    cfg["data"]["clip_len"] = 4.0
+    le = LabelEncoder(expand_vehicle=bool(cfg["data"].get("expand_vehicle", True)))
+    n_frames = int(cfg["data"]["clip_len"] * cfg["data"]["fps"])
+    model = build_model(cfg, len(le))
+    crit = SpanLoss(cfg, len(le), int(cfg["model"]["n_bins"]))
+
+    batch = {
+        "spans": torch.tensor([[[8., 30.], [-1., -1.]], [[4., 60.], [-1., -1.]]]),
+        "span_cls": torch.tensor([[0, -1], [1, -1]]),
+        "tier": torch.tensor([0, 1]),
+        "frame_target": torch.zeros(2, n_frames, len(le)),
+        "clip_target": torch.zeros(2, len(le)),
+        "n_events": torch.tensor([1, 1]),
+        "speech_target": torch.zeros(2, n_frames),
+        "has_vad": torch.zeros(2),
+    }
+    batch["frame_target"][0, 8:30, 0] = 1
+    batch["frame_target"][1, 4:60, 1] = 1
+    wav = torch.randn(2, int(cfg["data"]["clip_len"] * cfg["data"]["sr"]))
+    fv = torch.ones(2, n_frames)
+
+    ok, why = True, ""
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            out = model(wav, fv)
+            loss, logs = crit(out, batch)
+        loss.backward()
+    except Exception as e:                                    # noqa: BLE001
+        ok, why = False, "%s: %s" % (type(e).__name__, e)
+    check("autocast: the full loss runs in mixed precision", ok, why)
+    if not ok:
+        return
+    check("autocast: the loss is finite", bool(torch.isfinite(loss)),
+          "%.4f" % float(loss))
+    dead = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    check("autocast: every parameter receives a gradient (DDP requires it)",
+          not dead, "%d dead: %s" % (len(dead), dead[:3]))
 
 
 def test_quality_focal():
@@ -719,6 +775,7 @@ if __name__ == "__main__":
     test_diou()
     test_decode_spans()
     test_assign()
+    test_loss_under_autocast()
     test_quality_focal()
     test_level_ranges()
     test_soft_dice()

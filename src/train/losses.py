@@ -419,7 +419,11 @@ class SpanLoss:
                 # assigned class and on the agnostic channel. Negatives keep 0,
                 # which is what gives the head something to calibrate against.
                 q = (iou.detach().clamp(0, 1) * sel).unsqueeze(-1)
-                soft = torch.zeros_like(out["cls"][lvl])
+                # `iou` is fp32 (the targets from `assign_targets` are, and
+                # `torch.where` promotes to them) while `out["cls"]` is fp16
+                # under autocast, and `scatter_` will not mix the two. Build the
+                # soft label at the target's dtype; the losses below promote.
+                soft = torch.zeros_like(out["cls"][lvl], dtype=q.dtype)
                 soft.scatter_(2, tgt["cls_idx"][lvl].unsqueeze(-1), q)
                 soft[..., self.n_class] = q.squeeze(-1)
                 l_cls = l_cls + quality_focal(out["cls"][lvl], soft,
