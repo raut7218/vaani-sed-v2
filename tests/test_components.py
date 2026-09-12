@@ -184,6 +184,56 @@ def test_assign():
           "%.3f %.3f" % (idx - ds, idx + de))
 
 
+def test_sampler_epoch_length():
+    """Epoch length must not be hostage to the smallest pool.
+
+    This is the regression that cost two runs. Moving the synthetic clips out of
+    the gold pool made real gold (~8900 clips) the smallest pool, and deriving
+    the epoch from `min(pool // count)` silently cut it from 57792 clips to
+    25104 - so the model trained on 40% of the baseline's data, and 2.5x less
+    silver, on a split that is 87% silver.
+    """
+    from src.data.dataset import TierBatchSampler
+
+    pools = {"gold": 8900, "silver": 49300, "bronze": 17899, "synth": 20000}
+    recs, i = [], 0
+    for pool, n in pools.items():
+        for _ in range(n):
+            recs.append({"uid": str(i), "pool": pool,
+                         "tier": "gold" if pool in ("gold", "synth") else pool})
+            i += 1
+    quotas = {"gold": 0.21, "silver": 0.42, "bronze": 0.10, "synth": 0.27}
+
+    # The quotas in force when the regression happened, to show the mechanism:
+    # gold at 0.35 is 17 of a 48-clip batch, and 8900 // 17 = 523 batches.
+    broke = TierBatchSampler(recs, 48, {"gold": 0.35, "silver": 0.35,
+                                        "bronze": 0.10, "synth": 0.20}, seed=0)
+    check("sampler: the smallest pool used to set the epoch, and set it short",
+          broke._nb * 48 == 25104, "%d clips" % (broke._nb * 48))
+    check("sampler: it is still the binding pool under the current quotas",
+          TierBatchSampler(recs, 48, quotas, seed=0)._nb * 48 < 57600)
+
+    s = TierBatchSampler(recs, 48, quotas, seed=0, steps_per_epoch=1200)
+    draws = {k: s._nb * c for k, c in s.counts.items()}
+    check("sampler: steps_per_epoch sets the epoch directly",
+          s._nb * 48 == 57600, "%d clips" % (s._nb * 48))
+    check("sampler: silver is drawn at least as often as the 1.1881 baseline",
+          draws["silver"] >= 20468, "%d vs 20468" % draws["silver"])
+    check("sampler: the small pools still fill their share",
+          draws["gold"] > 0 and draws["synth"] > 0, "%s" % draws)
+
+    # every rank must yield the same count, or an all-reduce hangs
+    r0 = TierBatchSampler(recs, 48, quotas, seed=0, rank=0, world_size=2,
+                          steps_per_epoch=1200)
+    r1 = TierBatchSampler(recs, 48, quotas, seed=0, rank=1, world_size=2,
+                          steps_per_epoch=1200)
+    b0, b1 = list(r0), list(r1)
+    check("sampler: both ranks yield the same number of batches",
+          len(b0) == len(b1) == 600, "%d / %d" % (len(b0), len(b1)))
+    check("sampler: the ranks' batches are disjoint",
+          not ({tuple(b) for b in b0} & {tuple(b) for b in b1}))
+
+
 def test_loss_under_autocast():
     """The whole loss must survive mixed precision.
 
@@ -775,6 +825,7 @@ if __name__ == "__main__":
     test_diou()
     test_decode_spans()
     test_assign()
+    test_sampler_epoch_length()
     test_loss_under_autocast()
     test_quality_focal()
     test_level_ranges()

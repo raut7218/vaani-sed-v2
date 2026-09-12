@@ -282,7 +282,7 @@ class TierBatchSampler(Sampler):
 
     def __init__(self, records: Sequence[dict], batch_size: int,
                  quotas: Dict[str, float] | None = None, seed: int = 0,
-                 rank: int = 0, world_size: int = 1):
+                 rank: int = 0, world_size: int = 1, steps_per_epoch: int = 0):
         self.records = list(records)
         self.batch_size = int(batch_size)
         self.seed = seed
@@ -310,7 +310,27 @@ class TierBatchSampler(Sampler):
             self.counts[k] += 1
             rem -= 1
         self.counts = {k: v for k, v in self.counts.items() if v > 0}
-        self._nb = max(1, min(len(self.by_tier[k]) // c for k, c in self.counts.items()))
+        # Epoch length. Deriving it from the *smallest* pool - which is what
+        # `min` here does - couples it to whichever tier happens to be rarest,
+        # and that broke badly when the synthetic clips were moved out of the
+        # gold pool: real gold (~8900 clips) became the smallest pool and the
+        # epoch shrank from 57792 clips to 25104. Two runs then trained on 40%
+        # of the data the baseline had at its peak, and 2.5x less silver, on a
+        # validation split that is 87% silver. `steps_per_epoch` sets it
+        # directly instead; the pools that cannot fill it are reshuffled and
+        # drawn again, which is what `_global_batches` already does.
+        if steps_per_epoch > 0:
+            # Capped at four passes over the largest pool. `steps_per_epoch` is
+            # in global batches and so is a function of the corpus it was chosen
+            # for; without the cap, pointing this config at a small corpus (the
+            # smoke test's 78 clips, a partial download) turns one epoch into
+            # thousands of passes over the same handful of files.
+            widest = max(len(v) for v in self.by_tier.values())
+            self._nb = max(1, min(int(steps_per_epoch),
+                                  4 * widest // max(1, self.batch_size)))
+        else:
+            self._nb = max(1, min(len(self.by_tier[k]) // c
+                                  for k, c in self.counts.items()))
         # Truncate to a whole number of rounds so every rank yields the same
         # number of batches. A rank that runs short leaves its peers blocked in
         # an all-reduce that never completes.

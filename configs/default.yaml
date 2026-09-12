@@ -99,11 +99,20 @@ train:
   # 20000 synthetic clips used to sit inside the gold pool and outnumber the
   # ~8900 real gold clips there, so 69% of every gold draw was our own splicing
   # and the epoch length was set by it.
+  # Global batches per epoch, independent of pool sizes. 1200 x 48 = 57.6k
+  # clips, matching the diet the 1.1881 baseline was trained on. Leave at 0 to
+  # go back to "the smallest pool sets the epoch", which is what silently cut
+  # the epoch to 25k clips once synth left the gold pool.
+  steps_per_epoch: 1200
+  # Sampling pools, not loss tiers - `synth` is gold-tier for the loss. Sized so
+  # each epoch draws ~24k silver (the baseline drew 20.5k), ~12k real gold,
+  # ~15.6k synthetic: at least as much silver as the run being matched, without
+  # putting the synthetic clips back into the pool that sets the epoch length.
   tier_quotas:
-    gold: 0.35
-    silver: 0.35              # val is 85% silver; training at 50% gold was a
+    gold: 0.21
+    silver: 0.42              # val is 87% silver; training at 50% gold was a
     bronze: 0.10              # train/eval distribution mismatch on top of it
-    synth: 0.20
+    synth: 0.27
 
 loss:
   cls: 1.0                    # focal on actionness

@@ -392,7 +392,8 @@ def main() -> None:
     # The sampler seed is identical across ranks on purpose: every rank builds
     # the same global batch list and takes its own disjoint slice of it.
     sampler = TierBatchSampler(tr_recs, bs, t.get("tier_quotas"), seed=cfg["seed"],
-                               rank=rank, world_size=world)
+                               rank=rank, world_size=world,
+                               steps_per_epoch=int(t.get("steps_per_epoch", 0)))
     gen = torch.Generator()
     gen.manual_seed(int(cfg["seed"]) + 1000 * rank)     # per-rank worker seeds
     tr_ld = DataLoader(tr_ds, batch_sampler=sampler, num_workers=nw,
