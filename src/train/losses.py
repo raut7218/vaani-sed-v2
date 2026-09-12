@@ -267,9 +267,16 @@ def boundary_targets(spans: torch.Tensor, valid: torch.Tensor, n_hi: int,
 
     is_gold = (tier.view(B, 1) == TIER_GOLD)
     w_ev = torch.where(is_gold, torch.ones_like(on), torch.full_like(on, silver_w))
+    # Clip-edge boundaries are dropped for *every* tier, not just silver. An
+    # event that starts at 0.000 s or ends at the recording's last sample has no
+    # audible transient to find - the recording started or stopped, which is not
+    # a sound. The span head still learns them from the regression target; the
+    # branch would only learn to fire on silence. Silver is where this bites
+    # (29.6% of its events start at exactly 0.000 s against gold's 5.4%) but
+    # gold's 6.7% of events ending at the clip's end are the same non-event.
     edge = 0.5 * mult                                           # within half a base frame
-    w_on = torch.where(is_gold | (on > edge), w_ev, torch.zeros_like(w_ev)) * ok
-    w_off = torch.where(is_gold | (off < n_valid - edge), w_ev, torch.zeros_like(w_ev)) * ok
+    w_on = torch.where(on > edge, w_ev, torch.zeros_like(w_ev)) * ok
+    w_off = torch.where(off < n_valid - edge, w_ev, torch.zeros_like(w_ev)) * ok
 
     def bump(pos, w):
         g = torch.exp(-0.5 * ((grid - pos.unsqueeze(-1)) / sigma) ** 2)  # (B, M, n_hi)

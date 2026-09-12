@@ -19,6 +19,7 @@ from src.infer.decode import (boundary_agreement, finalise,          # noqa: E40
                               merge_close, refine_boundaries,
                               select_by_count, soft_nms_1d, wbf_1d)
 from src.models.trident import decode_spans                            # noqa: E402
+from src.train.losses import boundary_targets                          # noqa: E402
 from src.postproc.calibrate import district_of                         # noqa: E402
 from src.train.losses import (assign_targets, diou_1d,                 # noqa: E402
                               distribution_focal, soft_dice)
@@ -290,6 +291,51 @@ def test_boundary_agreement():
     check("agreement: aligned span scores near 1", a[0] > 0.85, "%.3f" % a[0])
     check("agreement: misaligned span scores near 0", a[1] < 0.1, "%.3f" % a[1])
     check("agreement: ranks the aligned span first", a[0] > a[1])
+
+
+def test_boundary_targets():
+    """The branch's supervision: right positions, right tiers, right edges."""
+    mult, n_frames, n_hi = 2, 200, 400
+    # gold clip: one event over base frames [10, 40] -> hi frames [20, 80]
+    # silver clip: one event over [0, 120], i.e. starting at the very first
+    #              sample - an annotation default, not an audible onset
+    spans = torch.tensor([[[10., 40.], [-1., -1.]],
+                          [[0., 120.], [-1., -1.]]])
+    valid = torch.ones(2, n_frames)
+    tier = torch.tensor([0, 1])                       # gold, silver
+    t, w = boundary_targets(spans, valid, n_hi, mult, tier, silver_w=0.15)
+
+    check("bmap: onset peaks at the event start",
+          int(t[0, 0].argmax()) == 20, "frame %d" % int(t[0, 0].argmax()))
+    check("bmap: offset peaks at the event end",
+          int(t[0, 1].argmax()) == 80, "frame %d" % int(t[0, 1].argmax()))
+    check("bmap: the peak is a bump, not a spike",
+          0.5 < float(t[0, 0, 19]) < 0.9, "%.3f" % float(t[0, 0, 19]))
+    check("bmap: gold boundaries carry full weight",
+          abs(float(w[0, 0, 20]) - 1.0) < 1e-5, "%.3f" % float(w[0, 0, 20]))
+    check("bmap: frames away from any boundary train as negatives",
+          abs(float(w[0, 0, 200]) - 1.0) < 1e-5 and float(t[0, 0, 200]) < 1e-3)
+
+    # silver, away from the edge: down-weighted but still supervised
+    check("bmap: silver offset is down-weighted",
+          abs(float(w[1, 1, 240]) - 0.15) < 1e-5, "%.3f" % float(w[1, 1, 240]))
+    # silver, at the clip edge: dropped entirely
+    check("bmap: a boundary at frame 0 is not a target",
+          float(t[1, 0].max()) < 1e-3, "%.4f" % float(t[1, 0].max()))
+
+    # a boundary at the end of the *valid* region is dropped too, even on gold
+    spans2 = torch.tensor([[[10., 200.], [-1., -1.]]])
+    t2, _ = boundary_targets(spans2, torch.ones(1, n_frames), n_hi, mult,
+                             torch.tensor([0]), silver_w=0.15)
+    check("bmap: a boundary at the clip's end is not a target",
+          float(t2[0, 1].max()) < 1e-3, "%.4f" % float(t2[0, 1].max()))
+    check("bmap: its onset still is", float(t2[0, 0].max()) > 0.5)
+
+    # padding must contribute nothing
+    pad = torch.full((1, 2, 2), -1.0)
+    t3, _ = boundary_targets(pad, torch.ones(1, n_frames), n_hi, mult,
+                             torch.tensor([0]), silver_w=0.15)
+    check("bmap: padded spans produce no targets", float(t3.max()) < 1e-3)
 
 
 # --------------------------------------------------------------------------- #
@@ -619,6 +665,7 @@ if __name__ == "__main__":
     test_soft_dice()
     test_sampler_sharding()
     test_tta_deshift()
+    test_boundary_targets()
     test_refine_boundaries()
     test_boundary_agreement()
     test_nms_and_fusion()
