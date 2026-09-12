@@ -178,8 +178,7 @@ def finalise(spans: np.ndarray, scores: np.ndarray, duration: float,
 
 def refine_boundaries(spans: np.ndarray, onset: np.ndarray, offset: np.ndarray,
                       hi_fps: float, duration: float, window_frac: float = 0.25,
-                      window_min: float = 0.08, peak_min: float = 0.20,
-                      temperature: float = 4.0) -> np.ndarray:
+                      window_min: float = 0.08, peak_min: float = 0.20) -> np.ndarray:
     """Snap each regressed endpoint onto the nearest boundary-branch peak.
 
     The pyramid proposes at 40 ms and the branch runs at 20 ms, but resolution is
@@ -189,11 +188,17 @@ def refine_boundaries(spans: np.ndarray, onset: np.ndarray, offset: np.ndarray,
     tolerance window, so a confident-but-wrong branch cannot turn a matching span
     into a missing one; the worst it can do is fail to help.
 
-    The new position is a softmax-weighted mean of the frame positions in the
-    window, not an argmax - the boundary sits between frames and the metric
-    measures the distance in seconds, so quantising to the 20 ms grid would throw
-    away a third of the tolerance on the shortest events. Endpoints whose window
-    holds no peak above `peak_min` are left exactly where the regression put them.
+    Sub-frame position comes from a parabola through the peak frame and its two
+    neighbours, in log-probability. Quantising to the 20 ms grid would throw away
+    a third of the tolerance on the shortest events, and a softmax-weighted mean
+    over the whole window - the obvious alternative - is *biased*: the window is
+    not centred on the peak, so whichever side is longer drags the estimate
+    towards it by however much background mass it holds. The parabola only ever
+    looks at three samples, and for a Gaussian peak log-probability is exactly
+    quadratic, so it is unbiased by construction.
+
+    Endpoints whose window holds no peak above `peak_min` are left exactly where
+    the regression put them.
     """
     if len(spans) == 0:
         return spans
@@ -207,11 +212,19 @@ def refine_boundaries(spans: np.ndarray, onset: np.ndarray, offset: np.ndarray,
             if hi - lo < 2:
                 continue
             seg = prob[lo:hi]
-            if seg.max() < peak_min:
+            k = int(np.argmax(seg))
+            if seg[k] < peak_min:
                 continue
-            e = np.exp(temperature * (seg - seg.max()))
-            t = (np.arange(lo, hi) + 0.5) / hi_fps
-            out[i, j] = float((e * t).sum() / e.sum())
+            k += lo
+            delta = 0.0
+            if 0 < k < n - 1:
+                l0, l1, l2 = (math.log(max(prob[k - 1], 1e-6)),
+                              math.log(max(prob[k], 1e-6)),
+                              math.log(max(prob[k + 1], 1e-6)))
+                den = l0 - 2.0 * l1 + l2
+                if den < -1e-9:                     # a real maximum, not a plateau
+                    delta = float(np.clip(0.5 * (l0 - l2) / den, -0.5, 0.5))
+            out[i, j] = (k + 0.5 + delta) / hi_fps
     out[:, 0] = np.clip(out[:, 0], 0.0, duration)
     out[:, 1] = np.clip(out[:, 1], 0.0, duration)
     bad = out[:, 1] <= out[:, 0]

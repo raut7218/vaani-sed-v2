@@ -185,12 +185,18 @@ class TridentHead(nn.Module):
         # ranking by "how good is this span" instead of "how centred is this
         # point" is what closes the 0.157 selection-oracle gap the diagnostics
         # report.
-        self.dgqp = None
+        # Exactly one of the two is built. Keeping the unused one around costs
+        # nothing in FLOPs but DDP counts its parameters as never receiving a
+        # gradient and refuses to run without `find_unused_parameters`, which is
+        # a whole-graph traversal every step to work around a dead 385-parameter
+        # conv.
+        self.dgqp = self.quality = None
         if dgqp:
             n_stat = 2 * (self.dgqp_topk + 1)
             self.dgqp = nn.Sequential(
                 nn.Linear(n_stat, 64), nn.GELU(), nn.Linear(64, 1))
-        self.quality = nn.Conv1d(d_model, 1, 3, padding=1)
+        else:
+            self.quality = nn.Conv1d(d_model, 1, 3, padding=1)
 
         self.register_buffer("bins", torch.arange(n_bins).float(), persistent=False)
         # Bias the actionness prior to ~1% positive, the standard focal-loss
@@ -206,7 +212,6 @@ class TridentHead(nn.Module):
             r = self.reg_norm[lvl](self.reg_tower(x))
             s_logits = self.start_out(r)                        # (B, bins, T)
             e_logits = self.end_out(r)
-            q = self.quality(r)
 
             s_p = s_logits.softmax(dim=1)
             e_p = e_logits.softmax(dim=1)
@@ -223,7 +228,7 @@ class TridentHead(nn.Module):
                 stat = torch.cat(st, dim=1).transpose(1, 2)     # (B, T, 2(k+1))
                 qual.append(self.dgqp(stat).squeeze(-1))
             else:
-                qual.append(q.squeeze(1))
+                qual.append(self.quality(r).squeeze(1))
             sbin.append(s_logits.transpose(1, 2))               # (B, T, bins)
             ebin.append(e_logits.transpose(1, 2))
         return {"cls": cls, "d_start": dstart, "d_end": dend, "quality": qual,

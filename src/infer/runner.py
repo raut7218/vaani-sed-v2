@@ -76,10 +76,13 @@ def _host_to_candidates(host: tuple, event, durations: np.ndarray,
         dur = float(durations[i])
         s, c = spans[i], scores[i]
         ok = (c > 1e-4) & (s[:, 1] > s[:, 0])
-        s, c = s[ok] - shift, c[ok]
-        s = np.clip(s, 0.0, dur)
+        s, c = s[ok], c[ok]
         if bmap is not None:
+            # Still in the *shifted* branch's own time: so is its boundary map,
+            # and undoing the TTA shift before reading the map would snap every
+            # endpoint onto a peak `shift` seconds away from where it belongs.
             on, off = bmap[i, 0], bmap[i, 1]
+            s = np.clip(s, 0.0, dur + shift)
             # Rank first, then move: agreement has to be read at the boundaries
             # the detector actually proposed, or every candidate gets credit for
             # a peak that refinement dragged it onto.
@@ -87,10 +90,11 @@ def _host_to_candidates(host: tuple, event, durations: np.ndarray,
             if aw > 0:
                 c = c * np.maximum(boundary_agreement(s, on, off, hi_fps), 1e-3) ** aw
             if bool(pp["refine"]):
-                s = refine_boundaries(s, on, off, hi_fps, dur,
+                s = refine_boundaries(s, on, off, hi_fps, dur + shift,
                                       window_frac=float(pp["refine_window"]),
                                       window_min=float(pp["refine_window_min"]),
                                       peak_min=float(pp["refine_peak_min"]))
+        s = np.clip(s - shift, 0.0, dur)
         s, c = soft_nms_1d(s, c, sigma=float(pp["nms_sigma"]),
                            iou_thr=float(pp["nms_iou"]),
                            max_out=int(pp["max_out"]))

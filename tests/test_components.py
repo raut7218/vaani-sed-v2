@@ -15,8 +15,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.evaluation.metrics import clip_dice, evaluate, match_events   # noqa: E402
-from src.infer.decode import (finalise, merge_close, select_by_count,  # noqa: E402
-                              soft_nms_1d, wbf_1d)
+from src.infer.decode import (boundary_agreement, finalise,          # noqa: E402
+                              merge_close, refine_boundaries,
+                              select_by_count, soft_nms_1d, wbf_1d)
 from src.models.trident import decode_spans                            # noqa: E402
 from src.postproc.calibrate import district_of                         # noqa: E402
 from src.train.losses import (assign_targets, diou_1d,                 # noqa: E402
@@ -229,6 +230,66 @@ def test_tta_deshift():
     check("tta: de-shift matches the shift applied", abs(dt - shift / 16000) < 1e-9,
           "%.4f s" % dt)
     check("tta: de-shift is ~20 ms, not ~0.8 ms", abs(dt - 0.02) < 1e-6)
+
+
+def _peaky(n, hi_fps, positions, width=1.0):
+    """A boundary map with Gaussian peaks at `positions` (seconds)."""
+    g = np.zeros(n, "float32")
+    t = (np.arange(n) + 0.5) / hi_fps
+    for p in positions:
+        g = np.maximum(g, np.exp(-0.5 * ((t - p) / (width / hi_fps)) ** 2))
+    return g
+
+
+def test_refine_boundaries():
+    """Refinement pulls an endpoint onto a peak, and only inside the tolerance."""
+    hi_fps, n = 50.0, 400
+    on = _peaky(n, hi_fps, [2.000])
+    off = _peaky(n, hi_fps, [3.000])
+
+    # A span 60 ms off on each side: both peaks are inside the window, so both
+    # endpoints should land on them to well under the metric's tolerance.
+    s = np.array([[2.06, 2.94]], "float32")
+    r = refine_boundaries(s, on, off, hi_fps, 8.0)
+    check("refine: onset snaps to the peak", abs(r[0, 0] - 2.0) < 0.012,
+          "%.4f s" % r[0, 0])
+    check("refine: offset snaps to the peak", abs(r[0, 1] - 3.0) < 0.012,
+          "%.4f s" % r[0, 1])
+
+    # A span so far off that no peak falls in its window must not be moved:
+    # refinement is allowed to fail to help, never to drag a boundary somewhere
+    # the detector never proposed.
+    s2 = np.array([[5.00, 6.00]], "float32")
+    r2 = refine_boundaries(s2, on, off, hi_fps, 8.0)
+    check("refine: leaves a span with no peak in range alone",
+          np.allclose(r2, s2), "%s" % r2.tolist())
+
+    # A flat map carries no boundary information at all.
+    flat = np.full(n, 0.05, "float32")
+    r3 = refine_boundaries(s, flat, flat, hi_fps, 8.0)
+    check("refine: a map below peak_min never moves anything",
+          np.allclose(r3, s), "%s" % r3.tolist())
+
+    # Sub-frame: the grid is 20 ms, so snapping to the nearest frame centre
+    # would leave up to 10 ms of error. The expectation has to do better.
+    on4 = _peaky(n, hi_fps, [2.013])
+    r4 = refine_boundaries(np.array([[2.05, 3.00]], "float32"), on4, off, hi_fps, 8.0)
+    check("refine: resolves between 20 ms frames", abs(r4[0, 0] - 2.013) < 0.008,
+          "%.4f s" % r4[0, 0])
+
+
+def test_boundary_agreement():
+    """Agreement ranks a well-placed span above a badly-placed one."""
+    hi_fps, n = 50.0, 400
+    on = _peaky(n, hi_fps, [2.0])
+    off = _peaky(n, hi_fps, [3.0])
+    a = boundary_agreement(np.array([[2.0, 3.0], [2.5, 3.5]], "float32"),
+                           on, off, hi_fps)
+    # 0.882, not 1.0: with 20 ms frames the peak at 2.000 s falls exactly
+    # between two frame centres, so neither samples its top.
+    check("agreement: aligned span scores near 1", a[0] > 0.85, "%.3f" % a[0])
+    check("agreement: misaligned span scores near 0", a[1] < 0.1, "%.3f" % a[1])
+    check("agreement: ranks the aligned span first", a[0] > a[1])
 
 
 # --------------------------------------------------------------------------- #
@@ -558,6 +619,8 @@ if __name__ == "__main__":
     test_soft_dice()
     test_sampler_sharding()
     test_tta_deshift()
+    test_refine_boundaries()
+    test_boundary_agreement()
     test_nms_and_fusion()
     test_district()
     test_ema_weight_norm()
