@@ -42,6 +42,8 @@ model:
                               # budget being 35 epochs short, not a schedule bug.
   boundary_branch: true       # 20 ms onset/offset head; see BoundaryBranch
   boundary_mult: 2            # refinement grid = this x the 25 fps detection grid
+  boundary_tap: 1             # CNN block the branch reads. 1 = 50 fps; 0 = the
+                              # log-mel + spectral flux at the full 100 fps
   dgqp: true                  # GFLv2 quality from the boundary distributions
   specaug: true
   flux: true                  # spectral-flux onset channels alongside the mel

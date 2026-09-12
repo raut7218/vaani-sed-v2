@@ -53,13 +53,15 @@ class MelCNN(nn.Module):
         super().__init__()
         pools = ((2, 2), (2, 2), (2, 1), (2, 1), (2, 1), (2, 1))
         blocks, c_in, f = [], in_ch, n_mels
-        # `hi_after` marks the block whose output the boundary branch taps. Time
-        # has been pooled 2x by then, so that tap is at 50 fps - 20 ms, half the
-        # detection grid's cell and the finest the branch can have without
-        # paying for the un-pooled 100 fps stage.
+        # `hi_after` marks the block whose output the boundary branch taps.
+        # 1 is the default: time has been pooled 2x by then, so the tap is at
+        # 50 fps - 20 ms, half the detection grid's cell. 0 taps the log-mel
+        # itself at the full 100 fps, spectral-flux channels included, which is
+        # the un-pooled onset signal and the fallback if 20 ms turns out not to
+        # be fine enough.
         self.hi_after = int(hi_after)
-        self.hi_dim = channels[self.hi_after - 1] * max(1, n_mels // 2 ** self.hi_after)
-        self.hi_fps_mult = 2 ** max(0, 2 - self.hi_after)
+        self.hi_dim = (in_ch * n_mels if self.hi_after == 0 else
+                       channels[self.hi_after - 1] * max(1, n_mels // 2 ** self.hi_after))
         for c, p in zip(channels, pools):
             blocks.append(nn.Sequential(
                 nn.Conv2d(c_in, c, 3, padding=1, bias=False),
@@ -71,13 +73,16 @@ class MelCNN(nn.Module):
         self.out_dim = channels[-1] * f
 
     def forward(self, x: torch.Tensor):
-        """Returns (base @25 fps, hi @50 fps) - both (B, T, D)."""
-        hi = None
+        """Returns (base @25 fps, hi @50 or 100 fps) - both (B, T, D)."""
+        def flat(t):
+            B, C, Fp, Tp = t.shape
+            return t.permute(0, 3, 1, 2).reshape(B, Tp, C * Fp)
+
+        hi = flat(x) if self.hi_after == 0 else None
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if i + 1 == self.hi_after:
-                B, C, Fp, Tp = x.shape
-                hi = x.permute(0, 3, 1, 2).reshape(B, Tp, C * Fp)
+                hi = flat(x)
         B, C, Fp, Tp = x.shape
         return x.permute(0, 3, 1, 2).reshape(B, Tp, C * Fp), hi
 
@@ -162,7 +167,7 @@ class VaaniSpanModel(nn.Module):
                  n_base_layers: int = 2, n_head: int = 8, dropout: float = 0.1,
                  use_specaug: bool = True, use_flux: bool = True,
                  max_count: int = 8, boundary_branch: bool = True,
-                 boundary_mult: int = 2, dgqp: bool = True):
+                 boundary_mult: int = 2, dgqp: bool = True, hi_after: int = 1):
         super().__init__()
         self.n_class, self.n_frames, self.fps = n_class, n_frames, float(fps)
         self.n_levels, self.n_bins = n_levels, n_bins
@@ -174,7 +179,8 @@ class VaaniSpanModel(nn.Module):
         self.logmel = LogMel(sr=sr, hop=hop, n_mels=n_mels)
         self.specaug = SpecAugment() if use_specaug else nn.Identity()
         self.cnn = MelCNN(in_ch=3 if use_flux else 1, n_mels=n_mels,
-                          dropout=dropout * 0.5).to(memory_format=torch.channels_last)
+                          dropout=dropout * 0.5,
+                          hi_after=hi_after).to(memory_format=torch.channels_last)
         self.encoder = encoder
         d_in = self.cnn.out_dim + (encoder.out_dim if encoder is not None else 0)
 
@@ -246,4 +252,5 @@ def build_model(cfg: dict, n_class: int, encoder: FusionEncoder | None = None
         max_count=int(m.get("max_count", 8)),
         boundary_branch=bool(m.get("boundary_branch", True)),
         boundary_mult=int(m.get("boundary_mult", 2)),
-        dgqp=bool(m.get("dgqp", True)))
+        dgqp=bool(m.get("dgqp", True)),
+        hi_after=int(m.get("boundary_tap", 1)))
