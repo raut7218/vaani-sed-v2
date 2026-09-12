@@ -138,8 +138,19 @@ postproc:
   max_out: 16
   score_scale: 1.0            # overwritten per district by the calibrator
   # --- boundary branch, applied before SoftNMS ---
-  refine: true                # snap endpoints onto the branch's peaks
-  refine_window: 0.25         # search +- max(this * duration, refine_window_min)
+  # Both OFF by default: measured on the 24-epoch fold-0 run, refinement *costs*
+  # score and does so monotonically in how much of it you do -
+  #   off 1.1723 | window 0.15 1.1643 | 0.25 1.1537 | 0.40 1.1300
+  #   off 1.1723 | peak_min 0.40 1.1675 | 0.20 1.1537 | 0.05 1.1489
+  # and boundary agreement in the ranking is a wash (1.1723 -> 1.1704). The
+  # reason is in the error distribution: the onset median is +0.010 s and the
+  # offset median +0.003 s, so the endpoints already inside a refinement window
+  # are the ones the regression head placed *well*. Moving them can only help if
+  # the branch is more accurate than the head, and as trained it is not. Turn
+  # these on only against a checkpoint whose branch has been shown to beat the
+  # head, not on principle.
+  refine: false               # snap endpoints onto the branch's peaks
+  refine_window: 0.15         # search +- max(this * duration, refine_window_min)
   refine_window_min: 0.08     # never wider than the metric's own tolerance
-  refine_peak_min: 0.20       # below this the window holds no boundary: don't move
-  agree_weight: 0.5           # exponent on boundary agreement in the span score
+  refine_peak_min: 0.40       # below this the window holds no boundary: don't move
+  agree_weight: 0.0           # exponent on boundary agreement in the span score

@@ -24,11 +24,11 @@ DEFAULT_POSTPROC = {
     "max_out": 16,
     "score_scale": 1.0,      # per-district calibration multiplies this
     # --- boundary branch ---
-    "refine": True,          # snap endpoints onto the 20 ms branch's peaks
-    "refine_window": 0.25,   # +- max(this * duration, refine_window_min) seconds
+    "refine": False,         # snap endpoints onto the 20 ms branch's peaks
+    "refine_window": 0.15,   # +- max(this * duration, refine_window_min) seconds
     "refine_window_min": 0.08,
-    "refine_peak_min": 0.20,
-    "agree_weight": 0.5,     # exponent on boundary agreement in the span score
+    "refine_peak_min": 0.40,
+    "agree_weight": 0.0,     # exponent on boundary agreement in the span score
 }
 
 

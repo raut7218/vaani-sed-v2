@@ -51,9 +51,19 @@ def priors_from_records(records, clip_len: float | None = None) -> tuple:
     *training* records: they are the only labelled sample of the same annotation
     process the test set went through.
     """
+    # Only clips that carry timestamps. Bronze clips have no events by
+    # definition, and averaging them in measures the wrong population: the
+    # evaluation references come from annotated clips alone. Including the
+    # corpus's 17899 bronze clips pulled the measured prior to 1.12 events per
+    # clip and 0.398 coverage, against the 1.44 / 0.548 the fold-0 references
+    # actually hold - so the "measured" prior came out further from the truth
+    # than the 1.22 constant it replaced, and the calibrator squeezed the
+    # operating point down to 1.07 events per clip and cost 0.04 of score.
     n_ev, cov = [], []
     for r in records:
         ev = r.get("events") or []
+        if not ev:
+            continue
         dur = float(r.get("duration") or 0.0)
         if clip_len:
             dur = min(dur, float(clip_len))
