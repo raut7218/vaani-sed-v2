@@ -34,8 +34,73 @@ And two ceilings that set the strategy:
   the decoder could not get it out.
 * A perfect model quantised to the 25 fps grid scores **1.988**. Frame rate is *not*
   the bottleneck — v1's README suggested raising `fps` to 50, which is worth **+0.006**.
+  *(Refined by the v2 measurements below: this is true of what a distribution can
+  **represent**, and false of what it can be trained to **resolve**. DFL resolution
+  scales with bin width, and bin width is the pyramid level's stride — which the
+  level-assignment table, not `fps`, decides.)*
 
 Reproduce any of these on your own checkpoint with `scripts/diagnose.py`.
+
+---
+
+## What v2 measured, and what it ruled out
+
+The v2 design above was built from the v1 diagnosis. Running it produced a
+checkpoint at **1.1881** (fold 0) and a second round of measurements, several of
+which contradict assumptions in this file. They are recorded here so the dead
+ends are not re-explored.
+
+**The score is bounded by boundary jitter, and the amount is known.** Push the
+real references through the real scorer with synthetic noise on every boundary:
+
+| jitter σ | 0.05 s | 0.10 s | 0.15 s | 0.20 s |
+|---|---|---|---|---|
+| score | 1.777 | 1.475 | 1.295 | **1.171** |
+
+The checkpoint scores 1.188. It behaves as a near-perfect detector carrying
+~0.19 s of jitter, and 1.6 would need that under 0.08 s.
+
+**Gold and silver are different annotation regimes.** Not the same process held
+to different standards — different processes:
+
+| | median event | coverage | starts at 0.000 s | spans whole clip |
+|---|---|---|---|---|
+| gold | 0.45 s | 0.287 | 5.4% | 0.9% |
+| silver | 0.98 s | 0.585 | **29.6%** | **11.7%** |
+
+Timestamps themselves are *not* quantised — 99.7% land off any 10 ms grid — so
+there is no hard label-noise ceiling. But training at a 50% gold quota while
+validating on a split that is 87% silver is a distribution mismatch, and a
+boundary head trained on silver's clip-edge "events" learns to fire on silence.
+
+**Ruled out by measurement:**
+
+| Tried | Result |
+|---|---|
+| Tuning the decoder (130 configs) | **+0.013**. The selection oracle is real but no *fixed rule* reaches it. |
+| A 20 ms onset/offset refinement branch | **Costs score**, monotonically in how much you apply it. |
+| Boundary agreement as a ranking term | A wash (1.1723 → 1.1704). |
+
+The branch failure is instructive rather than embarrassing. Probed directly, it
+*had* learned: its peak sits a median 0.072 s from a true onset and 0.044 s from
+an offset, against the 0.125 s a random peak in the same window would give. It is
+simply outclassed — the regression head's median error on those same endpoints is
+**+0.010 s**. Refinement was replacing a 10 ms error with a 50 ms one, and the
+errors that actually cost score (p10 −2.31 s, p90 +2.16 s) sit outside any window
+the metric's tolerance permits it to search.
+
+**Where the score actually goes.** Over one fixed candidate pool:
+
+| | score |
+|---|---|
+| as decoded | 1.1753 |
+| oracle **count**, own ranking | 1.2123 (+0.037) |
+| oracle **subset** | **1.4569 (+0.28)** |
+
+Choosing the right *number* of spans is worth almost nothing beside choosing the
+right *ones*. The candidates are good; the ranking cannot find them. That is what
+Quality Focal Loss addresses — a separate IoU head cannot, because it only ever
+sees positives and is never shown a bad span to calibrate against.
 
 ---
 
@@ -51,7 +116,7 @@ Reproduce any of these on your own checkpoint with `scripts/diagnose.py`.
 | **Losses** | frame BCE + clip BCE + consistency | focal + **1D DIoU** + **DFL** + **soft-Dice on the class-agnostic mask** | The leaderboard is F1 + Dice. Soft-Dice is literally half the metric, differentiably. |
 | **Mean teacher** | `lambda_cons: 2.0` | **removed**; EMA of *weights* only | Consistency is a smoothness prior and smoothness is the enemy here. v1's own history shows student ≈ teacher (Δ<0.005) from epoch 11 — past that it was contributing blur and nothing else. |
 | **MixStyle** | `p: 0.5` | removed; per-clip normalisation + per-district calibration | Same blur objection, and there are better domain-shift levers. |
-| **Silver tier** | 0.5 weight on the whole frame loss | full weight on tags, **0.25 on boundaries** | Silver's *tags* are as trustworthy as gold's. Only its *timestamps* are unverified. Weighting the whole loss confuses those two things. |
+| **Silver tier** | 0.5 weight on the whole frame loss | full weight on tags, **0.25 on boundaries** | Silver's *tags* are as trustworthy as gold's. Only its *timestamps* are unverified. Weighting the whole loss confuses those two things. *(The v2 label statistics below show this premise is only half right: silver is a different annotation **regime**, not the same one held to a lower standard.)* |
 | **Bronze tier** | attention pooling only | pooling **+ `make_synthetic.py`** | Cut a segment from a clip tagged `animal_sound`, paste it at a known position, and you have a strong label that is correct *by construction*. No confidence threshold, so no error to accumulate. |
 | **Validation** | one 5-state holdout | **state-grouped k-fold** | v1 tuned 8 classes × 4 params against one narrow slice. Val→LB dropped 0.16. |
 | **Test-time** | none | **transductive per-district calibration** | Filenames encode `State_District`; the test set spans ~150 of them. Uses only unlabelled test audio. |
