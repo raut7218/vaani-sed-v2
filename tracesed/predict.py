@@ -51,9 +51,35 @@ def load_span_model(path: str, ckpt_dir: str, dev):
         f"span model needs {cfg['model'].get('encoders')} under {ckpt_dir} - run scripts/fetch_encoders.py --all"
     model = build_model(cfg, len(le), enc)
     missing, _ = model.load_state_dict(ck["model"], strict=False)
-    bad = [k for k in missing if not k.startswith("head.dgqp")]
+    # frozen pretrained encoders may have been stripped on export (export_span_checkpoint);
+    # build_encoder has just loaded them from ckpt_dir
+    stripped = bool(ck.get("encoders_stripped"))
+    bad = [k for k in missing if not k.startswith("head.dgqp")
+           and not (stripped and k.startswith(ENCODER_PREFIX))]
     assert not bad, f"span checkpoint is missing {len(bad)} tensors, e.g. {bad[:3]}"
     return model.to(dev).eval(), cfg
+
+
+ENCODER_PREFIX = "encoder.encoders."
+
+
+def export_span_checkpoint(src: str, dst: str) -> None:
+    """Copy a span-model checkpoint without its frozen pretrained encoder weights.
+
+    The span model trains with frozen encoders (unfreeze_epoch 999), so those ~700 MB are
+    byte-identical to the public ATST-Frame / BEATs files fetch_encoders.py downloads.
+    Refuses to strip if the run unfroze them.
+    """
+    ck = torch.load(src, map_location="cpu", weights_only=False)
+    ue = int(ck["cfg"].get("train", {}).get("unfreeze_epoch", 999))
+    ep = int(ck.get("epoch", 0))
+    if ue <= ep:
+        torch.save(ck, dst)
+        print(f"[export] encoders were unfrozen at epoch {ue}: kept in full")
+        return
+    ck["model"] = {k: v for k, v in ck["model"].items() if not k.startswith(ENCODER_PREFIX)}
+    ck["encoders_stripped"] = True
+    torch.save(ck, dst)
 
 
 def find_meta(root: str, given: str) -> dict:
