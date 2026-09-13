@@ -32,6 +32,30 @@ DEFAULT_DECODE = {
 }
 
 
+def load_span_model(path: str, ckpt_dir: str, dev):
+    """The v2 span model, with its pretrained encoders read from `ckpt_dir`.
+
+    The checkpoint's config records encoder paths as they were on the training
+    machine; a local evaluation run keeps the encoder files wherever it likes.
+    """
+    from src.models.encoders import build_encoder
+    from src.models.span_model import build_model
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = ck["cfg"]
+    cfg["model"]["beats_dir"] = ckpt_dir
+    cfg["model"]["atst_ckpt"] = str(Path(ckpt_dir) / "atst_frame.ckpt")
+    cfg["model"]["beats_ckpt"] = str(Path(ckpt_dir) / "BEATs_iter3_plus_AS2M.pt")
+    le = LabelEncoder(expand_vehicle=bool(cfg["data"].get("expand_vehicle", True)))
+    enc = build_encoder(cfg["model"], ckpt_dir=ckpt_dir)
+    assert len(enc.encoders) == len(cfg["model"].get("encoders", [])), \
+        f"span model needs {cfg['model'].get('encoders')} under {ckpt_dir} - run scripts/fetch_encoders.py --all"
+    model = build_model(cfg, len(le), enc)
+    missing, _ = model.load_state_dict(ck["model"], strict=False)
+    bad = [k for k in missing if not k.startswith("head.dgqp")]
+    assert not bad, f"span checkpoint is missing {len(bad)} tensors, e.g. {bad[:3]}"
+    return model.to(dev).eval(), cfg
+
+
 def find_meta(root: str, given: str) -> dict:
     paths = [given] if given else [p for p in glob.glob(f"{root}/**/*.json", recursive=True) if "__MACOSX" not in p]
     for p in paths:
@@ -105,9 +129,8 @@ def main():
     f0c = {}
     if args.f0_ckpt:
         # natural clips: the v2 span model's proposals, re-ranked by TraceModel (tracesed/fuse.py)
-        from src.infer.predict import load_checkpoint
         from tracesed.fuse import f0_candidates
-        f0m, f0cfg = load_checkpoint(Path(args.f0_ckpt), dev)
+        f0m, f0cfg = load_span_model(args.f0_ckpt, args.ckpt_dir, dev)
         nat = [c for c in clips if not c["syn"]]
         f0c = f0_candidates(f0m, f0cfg["data"], dict(f0cfg.get("postproc", {})), nat, dev)
         del f0m

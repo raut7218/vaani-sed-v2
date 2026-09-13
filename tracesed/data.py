@@ -53,9 +53,12 @@ class ValBank:
 
     def __init__(self, meta_path: str, le, hold_fold: int = 0, load_heldout: bool = True):
         from src.data.labels import resolve_event_class
+        self.natural, self.snippets, self.hosts, self.synth, self.heldout = [], [], [], [], []
+        self.syn_rate = 0.0
+        if not meta_path:              # no validation set: the corpus trains alone
+            return
         vdir = Path(meta_path).parent
         meta = json.load(open(meta_path))
-        self.natural, self.snippets, self.hosts, self.synth, self.heldout = [], [], [], [], []
         for r in meta:
             u = r["segmentFileName"][:-4]
             syn = bool(r["syntheticData"])
