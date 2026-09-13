@@ -76,6 +76,28 @@ def infer_clips(model, clips, dev, win=8.0, hop=4.0, bs=24):
     return res
 
 
+def freeze_unused(model, b, cfg) -> int:
+    """Freeze trainable tensors that receive no gradient.
+
+    The pretrained checkpoints carry tensors off our forward path (heads and
+    norms of their pre-training objectives). DDP without unused-parameter
+    search - the fast mode - aborts on the first step if any trainable tensor
+    goes unreduced, so find them once, on one GPU, before wrapping.
+    """
+    model.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.float16, enabled=b["wav"].is_cuda):
+        out = model(b["wav"][:2], b["valid"][:2])
+    L = trace_losses(out, {k: v[:2] for k, v in b.items()}, cfg)
+    L["total"].backward()
+    n = 0
+    for p in model.parameters():
+        if p.requires_grad and p.grad is None:
+            p.requires_grad = False
+            n += 1
+    model.zero_grad(set_to_none=True)
+    return n
+
+
 def quick_decode(p, thr, min_dur=0.1, med=5):
     from scipy.ndimage import median_filter
     x = median_filter(p["pres"][:, -1].astype(np.float32), size=med) > thr
@@ -177,11 +199,13 @@ def main():
     step = 0; it = iter(dl); tl = time.time(); agg = {}
     heldout = bank.heldout
     while step < args.steps:
+        b = {k: v.to(dev, non_blocking=True) for k, v in next(it).items()}
         if step == args.frozen_steps:
             model.set_encoder_trainable(True)
+            n_off = freeze_unused(model, b, cfg)
             net = wrap(); opt = build_opt(True)
-            log(f"[stage] step {step}: encoders unfrozen, LLRD {args.llrd}, enc lr {args.enc_lr}")
-        b = {k: v.to(dev, non_blocking=True) for k, v in next(it).items()}
+            log(f"[stage] step {step}: encoders unfrozen, LLRD {args.llrd}, enc lr {args.enc_lr}, "
+                f"{n_off} checkpoint tensors off the forward path frozen")
         # schedule: linear warmup then cosine, per group relative to base_lr
         s_rel = step - (args.frozen_steps if step >= args.frozen_steps else 0)
         span = args.steps - (args.frozen_steps if step >= args.frozen_steps else 0)
