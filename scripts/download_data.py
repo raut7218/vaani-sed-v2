@@ -160,6 +160,8 @@ def main() -> None:
                          "once materialised, which halves peak disk use")
     ap.add_argument("--batch-rows", type=int, default=256,
                     help="parquet rows held in memory at once")
+    ap.add_argument("--skip-bronze", action="store_true",
+                    help="skip clips without timestamps (not decoded, not written)")
     args = ap.parse_args()
 
     token = resolve_token(args.token)
@@ -297,6 +299,11 @@ def main() -> None:
                     found, q = _lookup(row, TIER_COLUMNS)
                     if found:
                         quality_raw[str(q)] += 1
+                    if args.skip_bronze and not (_lookup(row, ["noisesubcategorytimestamp"])[1] or []):
+                        # no timestamps: nothing to supervise a detector with, so skip
+                        # the decode and the write (about a fifth of the corpus)
+                        n_skipped += 1
+                        continue
 
                     try:
                         if audio.get("bytes"):

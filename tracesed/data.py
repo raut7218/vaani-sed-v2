@@ -106,6 +106,8 @@ class TraceStream(IterableDataset):
 
     # ---- sources -----------------------------------------------------------
     def _corpus_wav(self, rec):
+        if "pack" not in rec:          # scripts/download_data.py layout: one FLAC per clip
+            return _read(str(Path(rec.get("_root", self.root)) / rec["path"]))
         fds = self.__dict__.setdefault("_fds", {})
         p = str(Path(rec.get("_root", self.root)) / rec["pack"])
         if p not in fds:
