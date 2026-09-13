@@ -148,6 +148,8 @@ def main():
     ap.add_argument("--w-cnt", type=float, default=0.2)
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--max-steps-time", type=float, default=0, help="stop after this many hours")
+    ap.add_argument("--hold-fold", type=int, default=0, help="validation fold held out for eval; -1 = train on all")
+    ap.add_argument("--seed", type=int, default=0, help="data-order and init seed (ensemble members differ here)")
     args = ap.parse_args()
 
     ddp = "LOCAL_RANK" in os.environ
@@ -157,12 +159,13 @@ def main():
     dev = torch.device("cuda")
     rank = int(os.environ.get("RANK", "0")); world = int(os.environ.get("WORLD_SIZE", "1"))
     torch.backends.cudnn.benchmark = True
-    torch.manual_seed(1234 + rank)
+    torch.manual_seed(1234 + 101 * args.seed + rank)
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
     le = LabelEncoder(expand_vehicle=True)
     t0 = time.time()
-    bank = ValBank(args.val_meta, le, hold_fold=0)
+    # --hold-fold -1: the full run trains on every validation fold and skips evaluation
+    bank = ValBank(args.val_meta, le, hold_fold=args.hold_fold)
     log(f"[bank] natural {len(bank.natural)} synth {len(bank.synth)} snippets {len(bank.snippets)} "
         f"hosts {len(bank.hosts)} held-out {len(bank.heldout)} rate {bank.syn_rate:.3f}/s ({time.time()-t0:.0f}s)")
     corpus = []
@@ -170,7 +173,7 @@ def main():
         for l in open(Path(args.corpus) / "manifest.jsonl"):
             if l.strip():
                 r = json.loads(l); r["_le_idx"] = le.idx; corpus.append(r)
-    ds = TraceStream(bank, corpus, args.corpus, len(le), json.loads(args.quotas), seed=7)
+    ds = TraceStream(bank, corpus, args.corpus, len(le), json.loads(args.quotas), seed=7 + 1000 * args.seed)
     log(f"[data] gold {len(ds.gold)} silver {len(ds.silver)} quotas {ds.quotas}")
     dl = DataLoader(ds, batch_size=args.bs, num_workers=args.workers, collate_fn=collate, pin_memory=True,
                     prefetch_factor=4, persistent_workers=True)
@@ -232,6 +235,8 @@ def main():
             sd = {k: v.half() if v.is_floating_point() else v for k, v in model.state_dict().items()}
             torch.save(dict(model=sd, args=vars(args), step=step), f"{args.out}/model.pt")   # save BEFORE eval
             try:
+                if not heldout:
+                    raise StopIteration("no held-out fold (--hold-fold -1)")
                 post = infer_clips(model, heldout, dev)
                 rows = quick_score(post, heldout)
                 log(f"[eval {step}] " + " | ".join(f"{k} {v[0]:.4f} thr {v[1]} F1 {v[2]:.3f} D {v[3]:.3f}" for k, v in rows.items()))

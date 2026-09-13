@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--ckpt-dir", default="checkpoints")
     ap.add_argument("--decode", default="", help="JSON file overriding DEFAULT_DECODE")
     ap.add_argument("--no-transcript", action="store_true", help="ignore transcripts even if present")
+    ap.add_argument("--f0-ckpt", default="", help="v2 span-model checkpoint (runs/f0/best.pt): natural clips "
+                                                  "use its candidates re-ranked by TraceModel")
     ap.add_argument("--out", default="/kaggle/working/submission.zip")
     args = ap.parse_args()
 
@@ -100,12 +102,27 @@ def main():
             for k in ("pres", "bnd", "ext", "count"):
                 post[u][k] = post[u][k] / len(args.ckpt)
 
+    f0c = {}
+    if args.f0_ckpt:
+        # natural clips: the v2 span model's proposals, re-ranked by TraceModel (tracesed/fuse.py)
+        from src.infer.predict import load_checkpoint
+        from tracesed.fuse import f0_candidates
+        f0m, f0cfg = load_checkpoint(Path(args.f0_ckpt), dev)
+        nat = [c for c in clips if not c["syn"]]
+        f0c = f0_candidates(f0m, f0cfg["data"], dict(f0cfg.get("postproc", {})), nat, dev)
+        del f0m
+        torch.cuda.empty_cache()
+        print(f"[f0] span candidates for {len(f0c)} natural clips")
+
     lines, n_ev = [], []
     for c in clips:
         u = c["uid"]; p = post[u]; sub = cfg["synthetic" if c["syn"] else "natural"]
         tr = None if args.no_transcript else meta.get(u, {}).get("transcript")
         fn = DECODERS[sub["decoder"]]
-        if sub["decoder"] == "thr":
+        if u in f0c:
+            from tracesed.fuse import rerank_topk
+            ev = rerank_topk(f0c[u], p, count_from(p, tr), cfg.get("fuse_w"))
+        elif sub["decoder"] == "thr":
             ev = fn(p, **sub["kw"])
         elif sub["decoder"] == "hsmm":
             ev = fn(p, count_from(p, tr), c["syn"], **sub["kw"])
